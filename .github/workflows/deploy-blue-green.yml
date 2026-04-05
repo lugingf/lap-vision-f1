@@ -1,0 +1,104 @@
+name: deploy-blue-green
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-f1-production
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+
+      - name: Lint
+        run: python -m ruff check app tests
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -p 'test_*.py'
+
+      - name: Build container image
+        run: docker build -t lap-vision-f1:ci .
+
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment: production
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_PATH: ${{ secrets.DEPLOY_PATH || '/opt/lap-vision' }}
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      F1_INTERNAL_TOKEN: ${{ secrets.F1_INTERNAL_TOKEN }}
+      F1_WORKERS: ${{ vars.F1_WORKERS || '2' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Validate deploy settings
+        run: |
+          : "${DEPLOY_HOST:?DEPLOY_HOST secret is required}"
+          : "${DEPLOY_USER:?DEPLOY_USER secret is required}"
+          : "${F1_INTERNAL_TOKEN:?F1_INTERNAL_TOKEN secret is required}"
+
+      - name: Add deploy host key
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          ssh-keyscan -p "${DEPLOY_PORT}" "${DEPLOY_HOST}" >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Upload lap-vision-f1 sources
+        run: |
+          REMOTE_INCOMING="${DEPLOY_PATH}/incoming/f1"
+          ssh -p "${DEPLOY_PORT}" "${DEPLOY_USER}@${DEPLOY_HOST}" "mkdir -p $(printf '%q' "${REMOTE_INCOMING}")"
+          tar \
+            --exclude=.git \
+            --exclude=.github \
+            --exclude=.venv \
+            --exclude=var \
+            --exclude=__pycache__ \
+            -czf - . \
+            | ssh -p "${DEPLOY_PORT}" "${DEPLOY_USER}@${DEPLOY_HOST}" "tar xzf - -C $(printf '%q' "${REMOTE_INCOMING}")"
+
+      - name: Blue-green deploy
+        run: |
+          REMOTE_CMD=$(
+            cat <<EOF
+          cd $(printf '%q' "${DEPLOY_PATH}/incoming/f1") &&
+          APP_ROOT=$(printf '%q' "${DEPLOY_PATH}") \
+          LAP_VISION_F1_INTERNAL_TOKEN=$(printf '%q' "${F1_INTERNAL_TOKEN}") \
+          LAP_VISION_F1_WORKERS=$(printf '%q' "${F1_WORKERS}") \
+          bash deploy/deploy_f1.sh
+          EOF
+          )
+          ssh -p "${DEPLOY_PORT}" "${DEPLOY_USER}@${DEPLOY_HOST}" "bash -lc $(printf '%q' "${REMOTE_CMD}")"
