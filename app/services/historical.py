@@ -69,9 +69,12 @@ def _cache_key_for_telemetry(request: TelemetryCompareRequest) -> str:
 def _cache_key_for_race_playback(request: RacePlaybackRequest) -> str:
     event_slug = _slugify_event(request.event)
     session_slug = request.session.strip().lower()
+    window_suffix = ""
+    if request.window_start_ms is not None or request.window_end_ms is not None:
+        window_suffix = f"__{max(0, request.window_start_ms or 0)}-{max(0, request.window_end_ms or 0)}"
     return (
         f"playback/{request.year}/{event_slug}/{session_slug}/"
-        f"race-playback-v4-{max(200, request.sample_step_ms)}ms.json"
+        f"race-playback-v7-{max(100, request.sample_step_ms)}ms{window_suffix}.json"
     )
 
 
@@ -286,7 +289,12 @@ def _pick_reference_track_polyline(session: Any, laps_frame: Any) -> tuple[list[
     return [], "unavailable"
 
 
-def _downsample_position_samples(frame: Any, sample_step_ms: int) -> list[dict[str, Any]]:
+def _downsample_position_samples(
+    frame: Any,
+    sample_step_ms: int,
+    window_start_ms: int | None = None,
+    window_end_ms: int | None = None,
+) -> list[dict[str, Any]]:
     if frame is None or not hasattr(frame, "iterrows"):
         return []
 
@@ -300,6 +308,10 @@ def _downsample_position_samples(frame: Any, sample_step_ms: int) -> list[dict[s
         y = _to_float(row.get("Y"))
         if time_ms is None or x is None or y is None:
             continue
+        if window_end_ms is not None and time_ms > window_end_ms:
+            if last_row is not None:
+                break
+            break
         current = {
             "time_ms": time_ms,
             "x": x,
@@ -307,6 +319,8 @@ def _downsample_position_samples(frame: Any, sample_step_ms: int) -> list[dict[s
             "status": str(row.get("Status")) if row.get("Status") is not None else None,
         }
         last_row = current
+        if window_start_ms is not None and time_ms < window_start_ms:
+            continue
         if last_time_ms is not None and (time_ms - last_time_ms) < sample_step_ms:
             continue
         samples.append(current)
@@ -316,6 +330,175 @@ def _downsample_position_samples(frame: Any, sample_step_ms: int) -> list[dict[s
         samples.append(last_row)
 
     return samples
+
+
+def _downsample_car_samples(
+    frame: Any,
+    sample_step_ms: int,
+    window_start_ms: int | None = None,
+    window_end_ms: int | None = None,
+) -> list[dict[str, Any]]:
+    if frame is None or not hasattr(frame, "iterrows"):
+        return []
+
+    samples: list[dict[str, Any]] = []
+    last_time_ms: int | None = None
+    last_row: dict[str, Any] | None = None
+
+    for _, row in frame.iterrows():
+        time_ms = _timedelta_to_ms(row.get("Time") or row.get("SessionTime"))
+        if time_ms is None:
+            continue
+        if window_end_ms is not None and time_ms > window_end_ms:
+            if last_row is not None:
+                break
+            break
+        current = {
+            "time_ms": time_ms,
+            "speed": _to_float(row.get("Speed")),
+            "throttle": _to_float(row.get("Throttle")),
+            "brake": _to_bool(row.get("Brake")),
+            "rpm": _to_float(row.get("RPM")),
+            "drs": _to_int(row.get("DRS")),
+            "gear": _to_int(row.get("nGear")),
+        }
+        last_row = current
+        if window_start_ms is not None and time_ms < window_start_ms:
+            continue
+        if last_time_ms is not None and (time_ms - last_time_ms) < sample_step_ms:
+            continue
+        samples.append(current)
+        last_time_ms = time_ms
+
+    if last_row is not None and (not samples or samples[-1]["time_ms"] != last_row["time_ms"]):
+        samples.append(last_row)
+
+    return samples
+
+
+def _driver_code_for_lap(lap: Any) -> str:
+    for key in ("Driver", "DriverNumber"):
+        value = lap.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip().upper()
+    return ""
+
+
+def _session_position_streams(
+    session: Any,
+    laps_frame: Any,
+    sample_step_ms: int,
+    window_start_ms: int | None = None,
+    window_end_ms: int | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    streams: dict[str, list[dict[str, Any]]] = {}
+    pos_data = _safe_session_attr(session, "pos_data")
+    if isinstance(pos_data, dict):
+        for driver_key, frame in pos_data.items():
+            samples = _downsample_position_samples(
+                frame,
+                sample_step_ms=sample_step_ms,
+                window_start_ms=window_start_ms,
+                window_end_ms=window_end_ms,
+            )
+            if samples:
+                streams[str(driver_key).strip().upper()] = samples
+    if streams:
+        return streams
+
+    if laps_frame is None or not hasattr(laps_frame, "iterlaps"):
+        return streams
+
+    try:
+        iterator = laps_frame.sort_values(["Driver", "LapNumber"]).iterlaps()
+    except Exception:
+        iterator = laps_frame.iterlaps()
+
+    for _, lap in iterator:
+        driver_code = _driver_code_for_lap(lap)
+        if not driver_code:
+            continue
+        try:
+            frame = lap.get_pos_data()
+        except Exception:
+            continue
+        samples = _downsample_position_samples(
+            frame,
+            sample_step_ms=sample_step_ms,
+            window_start_ms=window_start_ms,
+            window_end_ms=window_end_ms,
+        )
+        if not samples:
+            continue
+        streams.setdefault(driver_code, []).extend(samples)
+
+    for driver_code, samples in list(streams.items()):
+        samples.sort(key=lambda item: item["time_ms"])
+        deduped: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        for sample in samples:
+            time_ms = int(sample["time_ms"])
+            if time_ms in seen:
+                continue
+            seen.add(time_ms)
+            deduped.append(sample)
+        streams[driver_code] = deduped
+
+    return {driver_code: samples for driver_code, samples in streams.items() if len(samples) >= 2}
+
+
+def _session_car_streams(
+    session: Any,
+    sample_step_ms: int,
+    window_start_ms: int | None = None,
+    window_end_ms: int | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    streams: dict[str, list[dict[str, Any]]] = {}
+    car_data = _safe_session_attr(session, "car_data")
+    if isinstance(car_data, dict):
+        for driver_key, frame in car_data.items():
+            samples = _downsample_car_samples(
+                frame,
+                sample_step_ms=sample_step_ms,
+                window_start_ms=window_start_ms,
+                window_end_ms=window_end_ms,
+            )
+            if samples:
+                streams[str(driver_key).strip().upper()] = samples
+    return streams
+
+
+def _attach_telemetry_to_position_samples(
+    position_samples: list[dict[str, Any]],
+    telemetry_samples: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not position_samples or not telemetry_samples:
+        return position_samples
+
+    enriched: list[dict[str, Any]] = []
+    telemetry_index = 0
+    for sample in position_samples:
+        time_ms = int(sample.get("time_ms") or 0)
+        while telemetry_index + 1 < len(telemetry_samples) and telemetry_samples[telemetry_index + 1]["time_ms"] <= time_ms:
+            telemetry_index += 1
+
+        nearest = telemetry_samples[telemetry_index]
+        if telemetry_index + 1 < len(telemetry_samples):
+            candidate = telemetry_samples[telemetry_index + 1]
+            if abs(int(candidate["time_ms"]) - time_ms) < abs(int(nearest["time_ms"]) - time_ms):
+                nearest = candidate
+
+        enriched.append({
+            **sample,
+            "speed": nearest.get("speed"),
+            "throttle": nearest.get("throttle"),
+            "brake": nearest.get("brake"),
+            "rpm": nearest.get("rpm"),
+            "drs": nearest.get("drs"),
+            "gear": nearest.get("gear"),
+        })
+
+    return enriched
 
 
 def _track_bounds(
@@ -415,7 +598,7 @@ def fetch_race_playback_payload(request_payload: dict[str, Any], cache_dir: str)
     fastf1 = _import_fastf1(cache_dir)
 
     request = RacePlaybackRequest.model_validate(request_payload)
-    sample_step_ms = max(200, request.sample_step_ms)
+    sample_step_ms = max(100, request.sample_step_ms)
     session = fastf1.get_session(request.year, request.event, request.session)
     session.load(
         laps=True,
@@ -439,11 +622,32 @@ def fetch_race_playback_payload(request_payload: dict[str, Any], cache_dir: str)
         "drivers": [],
     }
 
-    pos_data = _safe_session_attr(session, "pos_data")
     laps_frame = _safe_session_attr(session, "laps")
     results_frame = _safe_session_attr(session, "results")
-    if not isinstance(pos_data, dict) or len(pos_data) == 0:
+    playback_start_ms = _estimate_race_start_ms(laps_frame)
+    raw_window_start_ms: int | None = None
+    raw_window_end_ms: int | None = None
+    if playback_start_ms is not None:
+        if request.window_start_ms is not None:
+            raw_window_start_ms = max(playback_start_ms, playback_start_ms + max(0, request.window_start_ms) - sample_step_ms)
+        if request.window_end_ms is not None:
+            raw_window_end_ms = max(playback_start_ms, playback_start_ms + max(0, request.window_end_ms) + sample_step_ms)
+
+    position_streams = _session_position_streams(
+        session,
+        laps_frame,
+        sample_step_ms=sample_step_ms,
+        window_start_ms=raw_window_start_ms,
+        window_end_ms=raw_window_end_ms,
+    )
+    if not position_streams:
         return response
+    car_streams = _session_car_streams(
+        session,
+        sample_step_ms=sample_step_ms,
+        window_start_ms=raw_window_start_ms,
+        window_end_ms=raw_window_end_ms,
+    ) if request.include_telemetry else {}
 
     result_rows: dict[str, dict[str, Any]] = {}
     driver_number_to_code: dict[str, str] = {}
@@ -463,16 +667,18 @@ def fetch_race_playback_payload(request_payload: dict[str, Any], cache_dir: str)
             if driver_number:
                 driver_number_to_code[driver_number] = normalized_code
 
-    playback_start_ms = _estimate_race_start_ms(laps_frame)
-
     driver_series: list[dict[str, Any]] = []
-    for driver_key, frame in pos_data.items():
-        samples = _downsample_position_samples(frame, sample_step_ms=sample_step_ms)
+    for driver_key, stream_samples in position_streams.items():
+        samples = list(stream_samples)
         if playback_start_ms is not None:
             samples = [sample for sample in samples if sample["time_ms"] >= playback_start_ms]
         if len(samples) < 2:
             continue
         normalized_code = driver_number_to_code.get(str(driver_key), str(driver_key).strip().upper())
+        if request.include_telemetry:
+            telemetry_samples = car_streams.get(normalized_code) or car_streams.get(str(driver_key).strip().upper()) or []
+            if telemetry_samples:
+                samples = _attach_telemetry_to_position_samples(samples, telemetry_samples)
         meta = result_rows.get(normalized_code, {})
         driver_series.append(
             {
@@ -500,6 +706,12 @@ def fetch_race_playback_payload(request_payload: dict[str, Any], cache_dir: str)
             normalized_sample = dict(sample)
             normalized_sample["time_ms"] = max(0, int(sample["time_ms"]) - time_offset_ms)
             normalized_samples.append(normalized_sample)
+        if request.window_start_ms is not None or request.window_end_ms is not None:
+            normalized_samples = [
+                sample for sample in normalized_samples
+                if (request.window_start_ms is None or sample["time_ms"] >= max(0, request.window_start_ms - sample_step_ms))
+                and (request.window_end_ms is None or sample["time_ms"] <= max(0, request.window_end_ms + sample_step_ms))
+            ]
         driver["samples"] = normalized_samples
 
     driver_series.sort(key=lambda item: (item.get("finish_position") or 999, item["driver_code"]))
@@ -815,9 +1027,12 @@ class HistoricalService:
         if not request.refresh:
             cached = self.cache.read_json(cache_key)
             if cached is not None:
-                cached["cache_hit"] = True
-                cached["cache_key"] = cache_key
-                return RacePlaybackResponse.model_validate(cached)
+                if cached.get("available") is False:
+                    cached = None
+                else:
+                    cached["cache_hit"] = True
+                    cached["cache_key"] = cache_key
+                    return RacePlaybackResponse.model_validate(cached)
 
         loop = asyncio.get_running_loop()
         payload = await loop.run_in_executor(
@@ -826,7 +1041,8 @@ class HistoricalService:
             request.model_dump(mode="json"),
             str(self.fastf1_cache_dir),
         )
-        self.cache.write_json(cache_key, payload)
+        if payload.get("available") is not False:
+            self.cache.write_json(cache_key, payload)
         payload["cache_hit"] = False
         payload["cache_key"] = cache_key
         return RacePlaybackResponse.model_validate(payload)

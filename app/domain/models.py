@@ -200,6 +200,9 @@ class RacePlaybackRequest(BaseModel):
     event: str | int
     session: str
     sample_step_ms: int = 1000
+    window_start_ms: int | None = None
+    window_end_ms: int | None = None
+    include_telemetry: bool = False
     refresh: bool = False
 
 
@@ -213,6 +216,12 @@ class RacePlaybackSample(BaseModel):
     x: float
     y: float
     status: str | None = None
+    speed: float | None = None
+    throttle: float | None = None
+    brake: bool | None = None
+    rpm: float | None = None
+    drs: int | None = None
+    gear: int | None = None
 
 
 class RacePlaybackTrack(BaseModel):
