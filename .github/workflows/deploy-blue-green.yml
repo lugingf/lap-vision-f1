@@ -5,6 +5,7 @@ on:
 
 permissions:
   contents: read
+  packages: write
 
 concurrency:
   group: deploy-f1-production
@@ -40,18 +41,56 @@ jobs:
       - name: Build container image
         run: docker build -t lap-vision-f1:ci .
 
-  deploy:
+  build-and-push-image:
     if: github.ref == 'refs/heads/main'
     needs: preflight
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image name
+        id: image
+        run: |
+          OWNER="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          echo "image=ghcr.io/${OWNER}/lap-vision-f1:${GITHUB_SHA}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build and push container
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.image.outputs.image }}
+
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    needs: build-and-push-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
     environment: production
     env:
-      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
-      DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
-      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-      DEPLOY_PATH: ${{ secrets.DEPLOY_PATH || '/opt/lap-vision' }}
-      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      # The same secret names the other three repositories use, so one set of credentials
+      # configured once serves them all.
+      DEPLOY_HOST: ${{ secrets.AWS_SSH_HOST }}
+      DEPLOY_PORT: ${{ secrets.AWS_SSH_PORT || '22' }}
+      DEPLOY_USER: ${{ secrets.AWS_SSH_USER }}
+      DEPLOY_PATH: ${{ vars.APP_DIR || '/opt/lap-vision' }}
+      GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
+      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
       F1_INTERNAL_TOKEN: ${{ secrets.F1_INTERNAL_TOKEN }}
       F1_WORKERS: ${{ vars.F1_WORKERS || '2' }}
 
@@ -62,12 +101,12 @@ jobs:
       - name: Setup SSH agent
         uses: webfactory/ssh-agent@v0.9.0
         with:
-          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+          ssh-private-key: ${{ secrets.AWS_SSH_PRIVATE_KEY }}
 
       - name: Validate deploy settings
         run: |
-          : "${DEPLOY_HOST:?DEPLOY_HOST secret is required}"
-          : "${DEPLOY_USER:?DEPLOY_USER secret is required}"
+          : "${DEPLOY_HOST:?AWS_SSH_HOST secret is required}"
+          : "${DEPLOY_USER:?AWS_SSH_USER secret is required}"
           : "${F1_INTERNAL_TOKEN:?F1_INTERNAL_TOKEN secret is required}"
 
       - name: Add deploy host key
@@ -77,28 +116,30 @@ jobs:
           ssh-keyscan -p "${DEPLOY_PORT}" "${DEPLOY_HOST}" >> ~/.ssh/known_hosts
           chmod 644 ~/.ssh/known_hosts
 
-      - name: Upload lap-vision-f1 sources
+      # Only the deploy script and the internal router config go to the server; the service
+      # itself travels as an image through GHCR. Building here would mean compiling pandas and
+      # numpy wheels on the production host.
+      - name: Upload deploy script
         run: |
-          REMOTE_INCOMING="${DEPLOY_PATH}/incoming/f1"
-          ssh -p "${DEPLOY_PORT}" "${DEPLOY_USER}@${DEPLOY_HOST}" "mkdir -p $(printf '%q' "${REMOTE_INCOMING}")"
-          tar \
-            --exclude=.git \
-            --exclude=.github \
-            --exclude=.venv \
-            --exclude=var \
-            --exclude=__pycache__ \
-            -czf - . \
-            | ssh -p "${DEPLOY_PORT}" "${DEPLOY_USER}@${DEPLOY_HOST}" "tar xzf - -C $(printf '%q' "${REMOTE_INCOMING}")"
+          REMOTE_DIR="${DEPLOY_PATH}/f1"
+          ssh -p "${DEPLOY_PORT}" "${DEPLOY_USER}@${DEPLOY_HOST}" "mkdir -p $(printf '%q' "${REMOTE_DIR}/deploy")"
+          scp -P "${DEPLOY_PORT}" ./deploy/deploy_f1.sh ./deploy/nginx.internal.conf \
+            "${DEPLOY_USER}@${DEPLOY_HOST}:${REMOTE_DIR}/deploy/"
 
       - name: Blue-green deploy
         run: |
+          IMAGE="${{ needs.build-and-push-image.outputs.image }}"
+          GHCR_USER="${GHCR_USERNAME:-${GITHUB_ACTOR}}"
           REMOTE_CMD=$(
             cat <<EOF
-          cd $(printf '%q' "${DEPLOY_PATH}/incoming/f1") &&
+          chmod +x $(printf '%q' "${DEPLOY_PATH}/f1/deploy/deploy_f1.sh") &&
           APP_ROOT=$(printf '%q' "${DEPLOY_PATH}") \
+          IMAGE=$(printf '%q' "${IMAGE}") \
+          GHCR_USERNAME=$(printf '%q' "${GHCR_USER}") \
+          GHCR_TOKEN=$(printf '%q' "${GHCR_TOKEN}") \
           LAP_VISION_F1_INTERNAL_TOKEN=$(printf '%q' "${F1_INTERNAL_TOKEN}") \
           LAP_VISION_F1_WORKERS=$(printf '%q' "${F1_WORKERS}") \
-          bash deploy/deploy_f1.sh
+          bash $(printf '%q' "${DEPLOY_PATH}/f1/deploy/deploy_f1.sh")
           EOF
           )
           ssh -p "${DEPLOY_PORT}" "${DEPLOY_USER}@${DEPLOY_HOST}" "bash -lc $(printf '%q' "${REMOTE_CMD}")"

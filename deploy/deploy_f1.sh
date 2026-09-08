@@ -1,13 +1,31 @@
 #!/usr/bin/env bash
 
-set -euo pipefail
+set -Eeuo pipefail
+
+# Deploys the FastF1 service as a blue-green pair from a prebuilt image in GHCR.
+#
+# The image is built in CI. Building here meant resolving pandas and numpy wheels on the
+# production host on every deploy, which is the heaviest build of the four services and the one
+# least worth doing next to live containers.
+#
+# The service has no public entry point: lap_vision reaches it by container name over the shared
+# docker network, so the router in front of it publishes no port.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 APP_ROOT="${APP_ROOT:-/opt/lap-vision}"
 NETWORK_NAME="${NETWORK_NAME:-lapvision_net}"
 APP_NAME="lapvision-f1"
 ROUTER_NAME="${ROUTER_NAME:-lapvision-f1-router}"
-IMAGE_NAME="${IMAGE_NAME:-lapvision/f1}"
+IMAGE="${IMAGE:?IMAGE is required}"
 TARGET_PORT=8010
+
+GHCR_USERNAME="${GHCR_USERNAME:-}"
+GHCR_TOKEN="${GHCR_TOKEN:-}"
+
+log() {
+  printf '[deploy] %s\n' "$*"
+}
 FASTF1_CACHE_CONTAINER_DIR="/var/lib/lap-vision-f1/fastf1-cache"
 DATA_CACHE_CONTAINER_DIR="/var/lib/lap-vision-f1/data-cache"
 
@@ -33,6 +51,14 @@ mkdir -p \
 
 docker network inspect "${NETWORK_NAME}" >/dev/null 2>&1 || docker network create "${NETWORK_NAME}" >/dev/null
 
+if [[ -n "${GHCR_USERNAME}" && -n "${GHCR_TOKEN}" ]]; then
+  log "login to ghcr.io"
+  echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
+fi
+
+log "pull image ${IMAGE}"
+docker pull "${IMAGE}"
+
 active_color="green"
 active_file="${APP_ROOT}/shared/f1-proxy/conf.d/f1_active.conf"
 if [[ -f "${active_file}" ]]; then
@@ -47,19 +73,8 @@ else
   next_color="blue"
 fi
 
-release_dir="${APP_ROOT}/f1/${next_color}"
-rm -rf "${release_dir}"
-mkdir -p "${release_dir}"
-
-cp Dockerfile "${release_dir}/Dockerfile"
-cp pyproject.toml "${release_dir}/pyproject.toml"
-cp README.md "${release_dir}/README.md"
-cp .dockerignore "${release_dir}/.dockerignore"
-cp -R app deploy tests "${release_dir}/"
-
-docker build -t "${IMAGE_NAME}:${next_color}" "${release_dir}"
-
 container_name="${APP_NAME}-${next_color}"
+log "start candidate container ${container_name}"
 docker rm -f "${container_name}" >/dev/null 2>&1 || true
 docker run -d \
   --name "${container_name}" \
@@ -73,7 +88,7 @@ docker run -d \
   -e LAP_VISION_F1_DATA_CACHE_DIR="${DATA_CACHE_CONTAINER_DIR}" \
   -v "${APP_ROOT}/shared/f1-cache/fastf1:${FASTF1_CACHE_CONTAINER_DIR}" \
   -v "${APP_ROOT}/shared/f1-cache/data:${DATA_CACHE_CONTAINER_DIR}" \
-  "${IMAGE_NAME}:${next_color}" >/dev/null
+  "${IMAGE}" >/dev/null
 
 for _ in $(seq 1 40); do
   health_status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}starting{{end}}' "${container_name}" 2>/dev/null || true)"
@@ -87,6 +102,7 @@ health_status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}
 if [[ "${health_status}" != "healthy" ]]; then
   docker logs "${container_name}" || true
   echo "lap-vision-f1 container did not become healthy" >&2
+  docker rm -f "${container_name}" >/dev/null 2>&1 || true
   exit 1
 fi
 
@@ -97,7 +113,7 @@ upstream f1_upstream {
 EOF
 
 if [[ ! -f "${APP_ROOT}/shared/f1-proxy/nginx.conf" ]]; then
-  cp deploy/nginx.internal.conf "${APP_ROOT}/shared/f1-proxy/nginx.conf"
+  cp "${SCRIPT_DIR}/nginx.internal.conf" "${APP_ROOT}/shared/f1-proxy/nginx.conf"
 fi
 
 if docker ps --format '{{.Names}}' | grep -qx "${ROUTER_NAME}"; then
@@ -118,4 +134,5 @@ if [[ "${old_container}" != "${container_name}" ]]; then
   docker rm -f "${old_container}" >/dev/null 2>&1 || true
 fi
 
-echo "lap-vision-f1 deployed: ${next_color}"
+log "lap-vision-f1 deployed: ${next_color}"
+docker image prune -af || true
