@@ -479,7 +479,10 @@ def _attach_telemetry_to_position_samples(
     telemetry_index = 0
     for sample in position_samples:
         time_ms = int(sample.get("time_ms") or 0)
-        while telemetry_index + 1 < len(telemetry_samples) and telemetry_samples[telemetry_index + 1]["time_ms"] <= time_ms:
+        while (
+            telemetry_index + 1 < len(telemetry_samples)
+            and telemetry_samples[telemetry_index + 1]["time_ms"] <= time_ms
+        ):
             telemetry_index += 1
 
         nearest = telemetry_samples[telemetry_index]
@@ -629,9 +632,15 @@ def fetch_race_playback_payload(request_payload: dict[str, Any], cache_dir: str)
     raw_window_end_ms: int | None = None
     if playback_start_ms is not None:
         if request.window_start_ms is not None:
-            raw_window_start_ms = max(playback_start_ms, playback_start_ms + max(0, request.window_start_ms) - sample_step_ms)
+            raw_window_start_ms = max(
+                playback_start_ms,
+                playback_start_ms + max(0, request.window_start_ms) - sample_step_ms,
+            )
         if request.window_end_ms is not None:
-            raw_window_end_ms = max(playback_start_ms, playback_start_ms + max(0, request.window_end_ms) + sample_step_ms)
+            raw_window_end_ms = max(
+                playback_start_ms,
+                playback_start_ms + max(0, request.window_end_ms) + sample_step_ms,
+            )
 
     position_streams = _session_position_streams(
         session,
@@ -676,7 +685,11 @@ def fetch_race_playback_payload(request_payload: dict[str, Any], cache_dir: str)
             continue
         normalized_code = driver_number_to_code.get(str(driver_key), str(driver_key).strip().upper())
         if request.include_telemetry:
-            telemetry_samples = car_streams.get(normalized_code) or car_streams.get(str(driver_key).strip().upper()) or []
+            telemetry_samples = (
+                car_streams.get(normalized_code)
+                or car_streams.get(str(driver_key).strip().upper())
+                or []
+            )
             if telemetry_samples:
                 samples = _attach_telemetry_to_position_samples(samples, telemetry_samples)
         meta = result_rows.get(normalized_code, {})
@@ -709,8 +722,14 @@ def fetch_race_playback_payload(request_payload: dict[str, Any], cache_dir: str)
         if request.window_start_ms is not None or request.window_end_ms is not None:
             normalized_samples = [
                 sample for sample in normalized_samples
-                if (request.window_start_ms is None or sample["time_ms"] >= max(0, request.window_start_ms - sample_step_ms))
-                and (request.window_end_ms is None or sample["time_ms"] <= max(0, request.window_end_ms + sample_step_ms))
+                if (
+                    request.window_start_ms is None
+                    or sample["time_ms"] >= max(0, request.window_start_ms - sample_step_ms)
+                )
+                and (
+                    request.window_end_ms is None
+                    or sample["time_ms"] <= max(0, request.window_end_ms + sample_step_ms)
+                )
             ]
         driver["samples"] = normalized_samples
 

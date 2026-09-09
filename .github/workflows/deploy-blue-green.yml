@@ -94,6 +94,8 @@ jobs:
       F1_INTERNAL_TOKEN: ${{ secrets.F1_INTERNAL_TOKEN }}
       F1_WORKERS: ${{ vars.F1_WORKERS || '2' }}
 
+      SSH_OPTS: -o BatchMode=yes -o IdentitiesOnly=yes -o PreferredAuthentications=publickey
+
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -102,6 +104,11 @@ jobs:
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.AWS_SSH_PRIVATE_KEY }}
+
+      # Prints fingerprints only, never key material. When a deploy fails with "Permission denied"
+      # this is what says whether the agent is even holding the key the server was given.
+      - name: Show loaded SSH key fingerprints
+        run: ssh-add -l
 
       - name: Validate deploy settings
         run: |
@@ -122,8 +129,8 @@ jobs:
       - name: Upload deploy script
         run: |
           REMOTE_DIR="${DEPLOY_PATH}/f1"
-          ssh -p "${DEPLOY_PORT}" "${DEPLOY_USER}@${DEPLOY_HOST}" "mkdir -p $(printf '%q' "${REMOTE_DIR}/deploy")"
-          scp -P "${DEPLOY_PORT}" ./deploy/deploy_f1.sh ./deploy/nginx.internal.conf \
+          ssh ${SSH_OPTS} -p "${DEPLOY_PORT}" "${DEPLOY_USER}@${DEPLOY_HOST}" "mkdir -p $(printf '%q' "${REMOTE_DIR}/deploy")"
+          scp ${SSH_OPTS} -P "${DEPLOY_PORT}" ./deploy/deploy_f1.sh ./deploy/nginx.internal.conf \
             "${DEPLOY_USER}@${DEPLOY_HOST}:${REMOTE_DIR}/deploy/"
 
       - name: Blue-green deploy
@@ -142,4 +149,4 @@ jobs:
           bash $(printf '%q' "${DEPLOY_PATH}/f1/deploy/deploy_f1.sh")
           EOF
           )
-          ssh -p "${DEPLOY_PORT}" "${DEPLOY_USER}@${DEPLOY_HOST}" "bash -lc $(printf '%q' "${REMOTE_CMD}")"
+          ssh ${SSH_OPTS} -p "${DEPLOY_PORT}" "${DEPLOY_USER}@${DEPLOY_HOST}" "bash -lc $(printf '%q' "${REMOTE_CMD}")"
