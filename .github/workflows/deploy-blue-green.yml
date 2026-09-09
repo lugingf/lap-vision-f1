@@ -94,7 +94,9 @@ jobs:
       F1_INTERNAL_TOKEN: ${{ secrets.F1_INTERNAL_TOKEN }}
       F1_WORKERS: ${{ vars.F1_WORKERS || '2' }}
 
-      SSH_OPTS: -o BatchMode=yes -o IdentitiesOnly=yes -o PreferredAuthentications=publickey
+      # IdentitiesOnly is deliberately absent: the deploy key lives in the ssh-agent and no
+      # IdentityFile is written, so it would make ssh offer nothing at all.
+      SSH_OPTS: -o BatchMode=yes -o PreferredAuthentications=publickey
 
     steps:
       - name: Checkout
