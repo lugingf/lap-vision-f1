@@ -5,7 +5,8 @@ description = "Internal Fast-F1 ingestion and cache service for Lap Vision"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "fastapi>=0.115.0",
+    "fastapi>=0.115.0,<0.136",
+    "starlette<1.1",
     "uvicorn[standard]>=0.30.0",
     "fastf1>=3.4.0",
     "pandas>=2.2.0",
