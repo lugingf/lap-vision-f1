@@ -8,6 +8,8 @@ from app.config import Settings
 from app.deps import get_historical_service, get_settings
 from app.domain.models import (
     HealthResponse,
+    ProxySettingsRequest,
+    ProxySettingsResponse,
     RacePlaybackRequest,
     RacePlaybackResponse,
     ScheduleResponse,
@@ -121,3 +123,25 @@ async def race_playback(
     historical_service: HistoricalServiceDep,
 ) -> RacePlaybackResponse:
     return await historical_service.race_playback(request)
+
+
+@router.get(
+    "/v1/admin/proxy",
+    response_model=ProxySettingsResponse,
+    dependencies=[Depends(require_internal_token)],
+)
+async def get_proxy(historical_service: HistoricalServiceDep) -> ProxySettingsResponse:
+    return ProxySettingsResponse(https_proxy=historical_service.get_proxy_url())
+
+
+@router.put(
+    "/v1/admin/proxy",
+    response_model=ProxySettingsResponse,
+    dependencies=[Depends(require_internal_token)],
+)
+async def set_proxy(
+    request: ProxySettingsRequest,
+    historical_service: HistoricalServiceDep,
+) -> ProxySettingsResponse:
+    historical_service.set_proxy_url(request.https_proxy)
+    return ProxySettingsResponse(https_proxy=historical_service.get_proxy_url())

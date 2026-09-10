@@ -13,6 +13,14 @@ class HealthResponse(BaseModel):
     worker_processes: int
 
 
+class ProxySettingsRequest(BaseModel):
+    https_proxy: str | None = None
+
+
+class ProxySettingsResponse(BaseModel):
+    https_proxy: str | None = None
+
+
 class ServiceOverview(BaseModel):
     service: str
     mode: str
