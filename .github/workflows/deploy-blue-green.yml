@@ -132,7 +132,7 @@ jobs:
         run: |
           REMOTE_DIR="${DEPLOY_PATH}/f1"
           ssh ${SSH_OPTS} -p "${DEPLOY_PORT}" "${DEPLOY_USER}@${DEPLOY_HOST}" "mkdir -p $(printf '%q' "${REMOTE_DIR}/deploy")"
-          scp ${SSH_OPTS} -P "${DEPLOY_PORT}" ./deploy/deploy_f1.sh ./deploy/nginx.internal.conf \
+          scp ${SSH_OPTS} -P "${DEPLOY_PORT}" ./deploy/deploy_f1.sh ./deploy/nginx.internal.conf ./deploy/f1-proxy-relay.sh \
             "${DEPLOY_USER}@${DEPLOY_HOST}:${REMOTE_DIR}/deploy/"
 
       - name: Blue-green deploy
@@ -141,7 +141,7 @@ jobs:
           GHCR_USER="${GHCR_USERNAME:-${GITHUB_ACTOR}}"
           REMOTE_CMD=$(
             cat <<EOF
-          chmod +x $(printf '%q' "${DEPLOY_PATH}/f1/deploy/deploy_f1.sh") &&
+          chmod +x $(printf '%q' "${DEPLOY_PATH}/f1/deploy/deploy_f1.sh") $(printf '%q' "${DEPLOY_PATH}/f1/deploy/f1-proxy-relay.sh") &&
           APP_ROOT=$(printf '%q' "${DEPLOY_PATH}") \
           IMAGE=$(printf '%q' "${IMAGE}") \
           GHCR_USERNAME=$(printf '%q' "${GHCR_USER}") \
