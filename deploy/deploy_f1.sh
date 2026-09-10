@@ -19,6 +19,7 @@ APP_NAME="lapvision-f1"
 ROUTER_NAME="${ROUTER_NAME:-lapvision-f1-router}"
 IMAGE="${IMAGE:?IMAGE is required}"
 TARGET_PORT=8010
+PROXY_TUNNEL_PORT="${PROXY_TUNNEL_PORT:-1080}"
 
 GHCR_USERNAME="${GHCR_USERNAME:-}"
 GHCR_TOKEN="${GHCR_TOKEN:-}"
@@ -50,6 +51,17 @@ mkdir -p \
   "${APP_ROOT}/f1"
 
 docker network inspect "${NETWORK_NAME}" >/dev/null 2>&1 || docker network create "${NETWORK_NAME}" >/dev/null
+
+# The container reaches the SSH-forwarded SOCKS proxy (see `make tunnel`) via a socat relay
+# bound to the docker bridge gateway IP on the host. ufw's default-deny INPUT chain blocks that
+# hop even though it never leaves the host, so open it narrowly to this network's own subnet.
+network_subnet="$(docker network inspect -f '{{(index .IPAM.Config 0).Subnet}}' "${NETWORK_NAME}" 2>/dev/null || true)"
+if [[ -n "${network_subnet}" ]] && command -v ufw >/dev/null 2>&1 && sudo -n ufw status 2>/dev/null | grep -q '^Status: active'; then
+  if ! sudo -n ufw status | grep -qE "^${PROXY_TUNNEL_PORT}/tcp[[:space:]]+ALLOW[[:space:]]+${network_subnet}"; then
+    log "opening ufw port ${PROXY_TUNNEL_PORT}/tcp for ${network_subnet} (f1 outbound proxy tunnel)"
+    sudo -n ufw allow from "${network_subnet}" to any port "${PROXY_TUNNEL_PORT}" proto tcp comment 'lap-vision-f1 proxy tunnel' >/dev/null
+  fi
+fi
 
 if [[ -n "${GHCR_USERNAME}" && -n "${GHCR_TOKEN}" ]]; then
   log "login to ghcr.io"
