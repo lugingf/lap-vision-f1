@@ -30,6 +30,7 @@ log() {
 }
 FASTF1_CACHE_CONTAINER_DIR="/var/lib/lap-vision-f1/fastf1-cache"
 DATA_CACHE_CONTAINER_DIR="/var/lib/lap-vision-f1/data-cache"
+LIVE_DATA_CONTAINER_DIR="/var/lib/lap-vision-f1/live-timing"
 
 required_vars=(
   APP_ROOT
@@ -49,6 +50,7 @@ mkdir -p \
   "${APP_ROOT}/shared/f1-proxy/conf.d" \
   "${APP_ROOT}/shared/f1-cache/fastf1" \
   "${APP_ROOT}/shared/f1-cache/data" \
+  "${APP_ROOT}/shared/f1-cache/live-timing" \
   "${APP_ROOT}/f1"
 
 docker network inspect "${NETWORK_NAME}" >/dev/null 2>&1 || docker network create "${NETWORK_NAME}" >/dev/null
@@ -164,8 +166,10 @@ docker run -d \
   -e LAP_VISION_F1_INTERNAL_TOKEN="${LAP_VISION_F1_INTERNAL_TOKEN}" \
   -e LAP_VISION_F1_FASTF1_CACHE_DIR="${FASTF1_CACHE_CONTAINER_DIR}" \
   -e LAP_VISION_F1_DATA_CACHE_DIR="${DATA_CACHE_CONTAINER_DIR}" \
+  -e LAP_VISION_F1_LIVE_DATA_DIR="${LIVE_DATA_CONTAINER_DIR}" \
   -v "${APP_ROOT}/shared/f1-cache/fastf1:${FASTF1_CACHE_CONTAINER_DIR}" \
   -v "${APP_ROOT}/shared/f1-cache/data:${DATA_CACHE_CONTAINER_DIR}" \
+  -v "${APP_ROOT}/shared/f1-cache/live-timing:${LIVE_DATA_CONTAINER_DIR}" \
   "${IMAGE}" >/dev/null
 
 for _ in $(seq 1 40); do
