@@ -131,7 +131,7 @@ async def race_playback(
     dependencies=[Depends(require_internal_token)],
 )
 async def get_proxy(historical_service: HistoricalServiceDep) -> ProxySettingsResponse:
-    return ProxySettingsResponse(https_proxy=historical_service.get_proxy_url())
+    return ProxySettingsResponse(https_proxies=historical_service.get_proxy_urls())
 
 
 @router.put(
@@ -143,5 +143,5 @@ async def set_proxy(
     request: ProxySettingsRequest,
     historical_service: HistoricalServiceDep,
 ) -> ProxySettingsResponse:
-    historical_service.set_proxy_url(request.https_proxy)
-    return ProxySettingsResponse(https_proxy=historical_service.get_proxy_url())
+    historical_service.set_proxy_urls(request.https_proxies)
+    return ProxySettingsResponse(https_proxies=historical_service.get_proxy_urls())

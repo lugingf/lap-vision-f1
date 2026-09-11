@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import math
 import os
+import random
 import threading
+from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from app.cache import CacheManager
 from app.domain.models import (
@@ -19,6 +21,8 @@ from app.domain.models import (
     TelemetryCompareResponse,
 )
 
+T = TypeVar("T")
+
 
 def _apply_proxy_env(proxy_url: str | None) -> None:
     if proxy_url:
@@ -29,9 +33,30 @@ def _apply_proxy_env(proxy_url: str | None) -> None:
         os.environ.pop("HTTP_PROXY", None)
 
 
-def _import_fastf1(cache_dir: str, proxy_url: str | None = None):
-    _apply_proxy_env(proxy_url)
+def _proxy_attempts(proxy_urls: list[str] | None) -> list[str | None]:
+    if not proxy_urls:
+        return [None]
+    shuffled = list(dict.fromkeys(url for url in proxy_urls if url))
+    if not shuffled:
+        return [None]
+    random.shuffle(shuffled)
+    return shuffled
 
+
+def _with_proxy_pool(proxy_urls: list[str] | None, fn: Callable[[], T]) -> T:
+    last_error: Exception | None = None
+    for proxy_url in _proxy_attempts(proxy_urls):
+        _apply_proxy_env(proxy_url)
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 - deliberately broad: fall through to the next proxy
+            last_error = exc
+            continue
+    assert last_error is not None
+    raise last_error
+
+
+def _import_fastf1(cache_dir: str):
     import fastf1  # type: ignore
 
     cache_path = Path(cache_dir)
@@ -563,18 +588,23 @@ def _estimate_race_start_ms(laps_frame: Any) -> int | None:
 
 
 def fetch_telemetry_compare_payload(
-    request_payload: dict[str, Any], cache_dir: str, proxy_url: str | None = None
+    request_payload: dict[str, Any], cache_dir: str, proxy_urls: list[str] | None = None
 ) -> dict[str, Any]:
-    fastf1 = _import_fastf1(cache_dir, proxy_url)
+    fastf1 = _import_fastf1(cache_dir)
 
     request = TelemetryCompareRequest.model_validate(request_payload)
-    session = fastf1.get_session(request.year, request.event, request.session)
-    session.load(
-        laps=True,
-        telemetry=True,
-        weather=False,
-        messages=False,
-    )
+
+    def _load() -> Any:
+        session = fastf1.get_session(request.year, request.event, request.session)
+        session.load(
+            laps=True,
+            telemetry=True,
+            weather=False,
+            messages=False,
+        )
+        return session
+
+    session = _with_proxy_pool(proxy_urls, _load)
 
     event = getattr(session, "event", None)
     laps_frame = _safe_session_attr(session, "laps")
@@ -613,19 +643,24 @@ def fetch_telemetry_compare_payload(
 
 
 def fetch_race_playback_payload(
-    request_payload: dict[str, Any], cache_dir: str, proxy_url: str | None = None
+    request_payload: dict[str, Any], cache_dir: str, proxy_urls: list[str] | None = None
 ) -> dict[str, Any]:
-    fastf1 = _import_fastf1(cache_dir, proxy_url)
+    fastf1 = _import_fastf1(cache_dir)
 
     request = RacePlaybackRequest.model_validate(request_payload)
     sample_step_ms = max(100, request.sample_step_ms)
-    session = fastf1.get_session(request.year, request.event, request.session)
-    session.load(
-        laps=True,
-        telemetry=True,
-        weather=False,
-        messages=False,
-    )
+
+    def _load() -> Any:
+        session = fastf1.get_session(request.year, request.event, request.session)
+        session.load(
+            laps=True,
+            telemetry=True,
+            weather=False,
+            messages=False,
+        )
+        return session
+
+    session = _with_proxy_pool(proxy_urls, _load)
 
     event = getattr(session, "event", None)
     response: dict[str, Any] = {
@@ -780,12 +815,12 @@ def fetch_race_playback_payload(
     return response
 
 
-def fetch_schedule_payload(year: int, cache_dir: str, proxy_url: str | None = None) -> dict[str, Any]:
-    fastf1 = _import_fastf1(cache_dir, proxy_url)
+def fetch_schedule_payload(year: int, cache_dir: str, proxy_urls: list[str] | None = None) -> dict[str, Any]:
+    fastf1 = _import_fastf1(cache_dir)
 
     import pandas as pd  # type: ignore
 
-    schedule = fastf1.get_event_schedule(year, include_testing=False)
+    schedule = _with_proxy_pool(proxy_urls, lambda: fastf1.get_event_schedule(year, include_testing=False))
     events: list[dict[str, Any]] = []
     session_columns = [
         column for column in schedule.columns if column.startswith("Session") and not column.endswith("Date")
@@ -825,18 +860,23 @@ def fetch_schedule_payload(year: int, cache_dir: str, proxy_url: str | None = No
 
 
 def fetch_session_payload(
-    request_payload: dict[str, Any], cache_dir: str, proxy_url: str | None = None
+    request_payload: dict[str, Any], cache_dir: str, proxy_urls: list[str] | None = None
 ) -> dict[str, Any]:
-    fastf1 = _import_fastf1(cache_dir, proxy_url)
+    fastf1 = _import_fastf1(cache_dir)
 
     request = SessionRequest.model_validate(request_payload)
-    session = fastf1.get_session(request.year, request.event, request.session)
-    session.load(
-        laps=request.include_laps,
-        telemetry=request.include_telemetry,
-        weather=request.include_weather,
-        messages=request.include_messages,
-    )
+
+    def _load() -> Any:
+        session = fastf1.get_session(request.year, request.event, request.session)
+        session.load(
+            laps=request.include_laps,
+            telemetry=request.include_telemetry,
+            weather=request.include_weather,
+            messages=request.include_messages,
+        )
+        return session
+
+    session = _with_proxy_pool(proxy_urls, _load)
 
     event = getattr(session, "event", None)
     descriptor = {
@@ -1006,16 +1046,17 @@ class HistoricalService:
         self.executor = ProcessPoolExecutor(max_workers=worker_processes)
         self._proxy_lock = threading.Lock()
 
-    def get_proxy_url(self) -> str | None:
+    def get_proxy_urls(self) -> list[str]:
         with self._proxy_lock:
             stored = self.cache.read_json(_PROXY_SETTINGS_KEY)
         if not stored:
-            return None
-        return stored.get("https_proxy") or None
+            return []
+        return [url for url in stored.get("https_proxies") or [] if url]
 
-    def set_proxy_url(self, proxy_url: str | None) -> None:
+    def set_proxy_urls(self, proxy_urls: list[str]) -> None:
+        cleaned = [url.strip() for url in proxy_urls if url and url.strip()]
         with self._proxy_lock:
-            self.cache.write_json(_PROXY_SETTINGS_KEY, {"https_proxy": proxy_url})
+            self.cache.write_json(_PROXY_SETTINGS_KEY, {"https_proxies": cleaned})
 
     async def get_schedule(self, year: int, refresh: bool = False) -> ScheduleResponse:
         cache_key = _cache_key_for_schedule(year)
@@ -1028,7 +1069,7 @@ class HistoricalService:
 
         loop = asyncio.get_running_loop()
         payload = await loop.run_in_executor(
-            self.executor, fetch_schedule_payload, year, str(self.fastf1_cache_dir), self.get_proxy_url()
+            self.executor, fetch_schedule_payload, year, str(self.fastf1_cache_dir), self.get_proxy_urls()
         )
         self.cache.write_json(cache_key, payload)
         payload["cache_hit"] = False
@@ -1050,7 +1091,7 @@ class HistoricalService:
             fetch_session_payload,
             request.model_dump(),
             str(self.fastf1_cache_dir),
-            self.get_proxy_url(),
+            self.get_proxy_urls(),
         )
         self.cache.write_json(cache_key, payload)
         payload["cache_hit"] = False
@@ -1072,7 +1113,7 @@ class HistoricalService:
             fetch_telemetry_compare_payload,
             request.model_dump(mode="json"),
             str(self.fastf1_cache_dir),
-            self.get_proxy_url(),
+            self.get_proxy_urls(),
         )
         self.cache.write_json(cache_key, payload)
         payload["cache_hit"] = False
@@ -1097,7 +1138,7 @@ class HistoricalService:
             fetch_race_playback_payload,
             request.model_dump(mode="json"),
             str(self.fastf1_cache_dir),
-            self.get_proxy_url(),
+            self.get_proxy_urls(),
         )
         if payload.get("available") is not False:
             self.cache.write_json(cache_key, payload)

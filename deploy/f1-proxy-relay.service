@@ -1,0 +1,28 @@
+# Reference copy only - deploy_f1.sh generates and installs the real unit on every deploy,
+# with PROXY_TUNNEL_PORTS/APP_ROOT/NETWORK_NAME substituted from its own env. Use this file only
+# for a manual install on a host that isn't going through deploy_f1.sh.
+[Unit]
+Description=lap-vision-f1 outbound proxy relay (socat, docker bridge -> loopback)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+# Keep PROXY_TUNNEL_PORTS in sync with deploy_f1.sh - one port per proxy source
+# (laptop, phone, a residential proxy, ...).
+Environment=PROXY_TUNNEL_PORTS=1080
+Environment=NETWORK_NAME=lapvision_net
+Environment=APP_ROOT=/opt/lap-vision
+# LAP_VISION_F1_INTERNAL_TOKEN lives outside the repo - create this file once with:
+#   echo 'LAP_VISION_F1_INTERNAL_TOKEN=<same token as F1_INTERNAL_TOKEN secret>' | \
+#     sudo tee /opt/lap-vision/f1-proxy-relay.env && sudo chmod 600 /opt/lap-vision/f1-proxy-relay.env
+# Without it, the relay still runs but skips auto-registering the proxy list.
+EnvironmentFile=-/opt/lap-vision/f1-proxy-relay.env
+WorkingDirectory=/opt/lap-vision/f1
+ExecStart=/usr/bin/bash /opt/lap-vision/f1/deploy/f1-proxy-relay.sh
+Restart=on-failure
+RestartSec=5
+User=ubuntu
+
+[Install]
+WantedBy=multi-user.target

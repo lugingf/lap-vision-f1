@@ -19,7 +19,8 @@ APP_NAME="lapvision-f1"
 ROUTER_NAME="${ROUTER_NAME:-lapvision-f1-router}"
 IMAGE="${IMAGE:?IMAGE is required}"
 TARGET_PORT=8010
-PROXY_TUNNEL_PORT="${PROXY_TUNNEL_PORT:-1080}"
+# One port per proxy source (laptop, phone, a residential proxy, ...) - comma-separated.
+PROXY_TUNNEL_PORTS="${PROXY_TUNNEL_PORTS:-${PROXY_TUNNEL_PORT:-1080}}"
 
 GHCR_USERNAME="${GHCR_USERNAME:-}"
 GHCR_TOKEN="${GHCR_TOKEN:-}"
@@ -52,15 +53,80 @@ mkdir -p \
 
 docker network inspect "${NETWORK_NAME}" >/dev/null 2>&1 || docker network create "${NETWORK_NAME}" >/dev/null
 
-# The container reaches the SSH-forwarded SOCKS proxy (see `make tunnel`) via a socat relay
-# bound to the docker bridge gateway IP on the host. ufw's default-deny INPUT chain blocks that
-# hop even though it never leaves the host, so open it narrowly to this network's own subnet.
+# The container reaches the SSH-forwarded SOCKS proxies (see `make tunnel` / f1-proxy-relay.sh)
+# via socat relays bound to the docker bridge gateway IP on the host. ufw's default-deny INPUT
+# chain blocks that hop even though it never leaves the host, so open each port narrowly to this
+# network's own subnet.
 network_subnet="$(docker network inspect -f '{{(index .IPAM.Config 0).Subnet}}' "${NETWORK_NAME}" 2>/dev/null || true)"
 if [[ -n "${network_subnet}" ]] && command -v ufw >/dev/null 2>&1 && sudo -n ufw status 2>/dev/null | grep -q '^Status: active'; then
-  if ! sudo -n ufw status | grep -qE "^${PROXY_TUNNEL_PORT}/tcp[[:space:]]+ALLOW[[:space:]]+${network_subnet}"; then
-    log "opening ufw port ${PROXY_TUNNEL_PORT}/tcp for ${network_subnet} (f1 outbound proxy tunnel)"
-    sudo -n ufw allow from "${network_subnet}" to any port "${PROXY_TUNNEL_PORT}" proto tcp comment 'lap-vision-f1 proxy tunnel' >/dev/null
+  ufw_status="$(sudo -n ufw status)"
+  IFS=',' read -ra proxy_tunnel_ports <<< "${PROXY_TUNNEL_PORTS//[[:space:]]/}"
+  for proxy_tunnel_port in "${proxy_tunnel_ports[@]}"; do
+    [[ -n "${proxy_tunnel_port}" ]] || continue
+    if ! grep -qE "^${proxy_tunnel_port}/tcp[[:space:]]+ALLOW[[:space:]]+${network_subnet}" <<< "${ufw_status}"; then
+      log "opening ufw port ${proxy_tunnel_port}/tcp for ${network_subnet} (f1 outbound proxy tunnel)"
+      sudo -n ufw allow from "${network_subnet}" to any port "${proxy_tunnel_port}" proto tcp comment 'lap-vision-f1 proxy tunnel' >/dev/null
+    fi
+  done
+fi
+
+# Outbound proxy relay: fully provisioned here so nothing needs to be done by hand on the host.
+# Regenerates the systemd unit from the current PROXY_TUNNEL_PORTS/APP_ROOT on every deploy;
+# deploy/f1-proxy-relay.service in the repo is a static copy for reference / manual install only.
+if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+  if ! command -v socat >/dev/null 2>&1; then
+    log "installing socat (outbound proxy relay)"
+    sudo -n apt-get update -qq && sudo -n apt-get install -y -qq socat
   fi
+
+  relay_env_file="${APP_ROOT}/f1-proxy-relay.env"
+  relay_env_tmp="$(mktemp)"
+  printf 'LAP_VISION_F1_INTERNAL_TOKEN=%s\n' "${LAP_VISION_F1_INTERNAL_TOKEN}" > "${relay_env_tmp}"
+  relay_changed=0
+  if ! sudo -n cmp -s "${relay_env_tmp}" "${relay_env_file}" 2>/dev/null; then
+    sudo -n install -m 600 "${relay_env_tmp}" "${relay_env_file}"
+    relay_changed=1
+  fi
+  rm -f "${relay_env_tmp}"
+
+  relay_unit_tmp="$(mktemp)"
+  cat > "${relay_unit_tmp}" <<EOF
+[Unit]
+Description=lap-vision-f1 outbound proxy relay (socat, docker bridge -> loopback)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+Environment=PROXY_TUNNEL_PORTS=${PROXY_TUNNEL_PORTS}
+Environment=NETWORK_NAME=${NETWORK_NAME}
+Environment=APP_ROOT=${APP_ROOT}
+EnvironmentFile=-${relay_env_file}
+WorkingDirectory=${APP_ROOT}/f1
+ExecStart=/usr/bin/bash ${APP_ROOT}/f1/deploy/f1-proxy-relay.sh
+Restart=on-failure
+RestartSec=5
+User=$(id -un)
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  relay_unit_path="/etc/systemd/system/f1-proxy-relay.service"
+  if ! sudo -n cmp -s "${relay_unit_tmp}" "${relay_unit_path}" 2>/dev/null; then
+    log "installing f1-proxy-relay systemd unit"
+    sudo -n cp "${relay_unit_tmp}" "${relay_unit_path}"
+    sudo -n systemctl daemon-reload
+    relay_changed=1
+  fi
+  rm -f "${relay_unit_tmp}"
+
+  sudo -n systemctl enable f1-proxy-relay >/dev/null 2>&1 || true
+  if [[ "${relay_changed}" -eq 1 ]] || ! sudo -n systemctl is-active --quiet f1-proxy-relay; then
+    log "(re)starting f1-proxy-relay"
+    sudo -n systemctl restart f1-proxy-relay
+  fi
+else
+  log "no passwordless sudo available; skipping f1-proxy-relay systemd setup (see deploy/f1-proxy-relay.service)"
 fi
 
 if [[ -n "${GHCR_USERNAME}" && -n "${GHCR_TOKEN}" ]]; then

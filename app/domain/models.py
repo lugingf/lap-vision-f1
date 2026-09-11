@@ -14,11 +14,11 @@ class HealthResponse(BaseModel):
 
 
 class ProxySettingsRequest(BaseModel):
-    https_proxy: str | None = None
+    https_proxies: list[str] = Field(default_factory=list)
 
 
 class ProxySettingsResponse(BaseModel):
-    https_proxy: str | None = None
+    https_proxies: list[str] = Field(default_factory=list)
 
 
 class ServiceOverview(BaseModel):
