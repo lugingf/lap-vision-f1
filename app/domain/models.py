@@ -155,6 +155,25 @@ class SessionBundle(BaseModel):
     cache_key: str
 
 
+class LiveSessionRequest(BaseModel):
+    year: int
+    event: str | int
+    session: str
+    include_telemetry: bool = True
+
+
+class LiveSessionStatus(BaseModel):
+    running: bool
+    year: int | None = None
+    event: str | int | None = None
+    session: str | None = None
+    started_at: str | None = None
+    last_update: str | None = None
+    last_error: str | None = None
+    raw_bytes: int = 0
+    snapshot_available: bool = False
+
+
 class TelemetryCompareRequest(BaseModel):
     year: int
     event: str | int

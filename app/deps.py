@@ -3,6 +3,7 @@ from __future__ import annotations
 from app.cache import CacheManager
 from app.config import Settings, load_settings
 from app.services.historical import HistoricalService
+from app.services.live import LiveSessionService
 
 _settings = load_settings()
 _cache = CacheManager(_settings.data_cache_dir)
@@ -10,6 +11,11 @@ _historical_service = HistoricalService(
     fastf1_cache_dir=_settings.fastf1_cache_dir,
     cache=_cache,
     worker_processes=_settings.worker_processes,
+)
+_live_service = LiveSessionService(
+    historical=_historical_service,
+    live_data_dir=_settings.live_data_dir,
+    quantum_seconds=_settings.live_quantum_seconds,
 )
 
 
@@ -19,3 +25,7 @@ def get_settings() -> Settings:
 
 def get_historical_service() -> HistoricalService:
     return _historical_service
+
+
+def get_live_service() -> LiveSessionService:
+    return _live_service

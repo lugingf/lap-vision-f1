@@ -877,7 +877,10 @@ def fetch_session_payload(
         return session
 
     session = _with_proxy_pool(proxy_urls, _load)
+    return _session_to_bundle_payload(session, request)
 
+
+def _session_to_bundle_payload(session: Any, request: SessionRequest) -> dict[str, Any]:
     event = getattr(session, "event", None)
     descriptor = {
         "season_year": request.year,
@@ -1034,6 +1037,29 @@ def fetch_session_payload(
         "telemetry_available": telemetry_available,
         "position_data_available": position_data_available,
     }
+
+
+def fetch_live_snapshot_payload(raw_file: str, cache_dir: str, request_payload: dict[str, Any]) -> dict[str, Any]:
+    """Re-parse a growing SignalR recording into a session-bundle-shaped snapshot.
+
+    Unlike the historical fetch_* functions, this never touches the network - it reads
+    whatever `fastf1.livetiming.client.SignalRClient` has written to `raw_file` so far, so it
+    can be called repeatedly (once per "quantum") while a session is still live.
+    """
+    fastf1 = _import_fastf1(cache_dir)
+    from fastf1.livetiming.data import LiveTimingData  # type: ignore
+
+    request = SessionRequest.model_validate(request_payload)
+    livedata = LiveTimingData(raw_file)
+    session = fastf1.get_session(request.year, request.event, request.session)
+    session.load(
+        laps=True,
+        telemetry=request.include_telemetry,
+        weather=True,
+        messages=True,
+        livedata=livedata,
+    )
+    return _session_to_bundle_payload(session, request)
 
 
 _PROXY_SETTINGS_KEY = "runtime/proxy.json"

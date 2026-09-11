@@ -26,6 +26,8 @@ class Settings:
     root_dir: Path
     fastf1_cache_dir: Path
     data_cache_dir: Path
+    live_data_dir: Path
+    live_quantum_seconds: int
 
 
 def load_settings() -> Settings:
@@ -46,4 +48,9 @@ def load_settings() -> Settings:
             os.getenv("LAP_VISION_F1_DATA_CACHE_DIR"),
             var_dir / "data-cache",
         ),
+        live_data_dir=_resolve_dir(
+            os.getenv("LAP_VISION_F1_LIVE_DATA_DIR"),
+            var_dir / "live-timing",
+        ),
+        live_quantum_seconds=max(1, int(os.getenv("LAP_VISION_F1_LIVE_QUANTUM_SECONDS", "5"))),
     )

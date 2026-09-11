@@ -3,11 +3,14 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi.responses import JSONResponse
 
 from app.config import Settings
-from app.deps import get_historical_service, get_settings
+from app.deps import get_historical_service, get_live_service, get_settings
 from app.domain.models import (
     HealthResponse,
+    LiveSessionRequest,
+    LiveSessionStatus,
     ProxySettingsRequest,
     ProxySettingsResponse,
     RacePlaybackRequest,
@@ -20,11 +23,13 @@ from app.domain.models import (
     TelemetryCompareResponse,
 )
 from app.services.historical import HistoricalService
+from app.services.live import LiveSessionService
 
 router = APIRouter()
 
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 HistoricalServiceDep = Annotated[HistoricalService, Depends(get_historical_service)]
+LiveServiceDep = Annotated[LiveSessionService, Depends(get_live_service)]
 
 
 def require_internal_token(
@@ -145,3 +150,59 @@ async def set_proxy(
 ) -> ProxySettingsResponse:
     historical_service.set_proxy_urls(request.https_proxies)
     return ProxySettingsResponse(https_proxies=historical_service.get_proxy_urls())
+
+
+@router.post(
+    "/v1/live/sessions/start",
+    response_model=LiveSessionStatus,
+    dependencies=[Depends(require_internal_token)],
+)
+async def start_live_session(
+    request: LiveSessionRequest,
+    live_service: LiveServiceDep,
+) -> LiveSessionStatus:
+    return await live_service.start(request)
+
+
+@router.post(
+    "/v1/live/sessions/stop",
+    response_model=LiveSessionStatus,
+    dependencies=[Depends(require_internal_token)],
+)
+async def stop_live_session(
+    request: LiveSessionRequest,
+    live_service: LiveServiceDep,
+) -> LiveSessionStatus:
+    return await live_service.stop(request)
+
+
+@router.get(
+    "/v1/live/sessions/status",
+    response_model=LiveSessionStatus,
+    dependencies=[Depends(require_internal_token)],
+)
+async def live_session_status(
+    live_service: LiveServiceDep,
+    year: int = Query(...),
+    event: str = Query(...),
+    session: str = Query(...),
+) -> LiveSessionStatus:
+    return live_service.status(LiveSessionRequest(year=year, event=event, session=session))
+
+
+@router.get(
+    "/v1/live/sessions/snapshot",
+    response_model=SessionBundle,
+    dependencies=[Depends(require_internal_token)],
+)
+async def live_session_snapshot(
+    live_service: LiveServiceDep,
+    year: int = Query(...),
+    event: str = Query(...),
+    session: str = Query(...),
+) -> SessionBundle | JSONResponse:
+    payload = live_service.snapshot(LiveSessionRequest(year=year, event=event, session=session))
+    if payload is None:
+        return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content={"detail": "no snapshot available yet"})
+    payload = {**payload, "cache_hit": False, "cache_key": "live"}
+    return SessionBundle.model_validate(payload)
