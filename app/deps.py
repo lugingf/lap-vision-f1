@@ -4,6 +4,7 @@ from app.cache import CacheManager
 from app.config import Settings, load_settings
 from app.services.historical import HistoricalService
 from app.services.live import LiveSessionService
+from app.services.prefetch import SessionPrefetchScheduler
 
 _settings = load_settings()
 _cache = CacheManager(_settings.data_cache_dir)
@@ -17,6 +18,13 @@ _live_service = LiveSessionService(
     live_data_dir=_settings.live_data_dir,
     quantum_seconds=_settings.live_quantum_seconds,
 )
+_prefetch_scheduler = SessionPrefetchScheduler(
+    historical=_historical_service,
+    cache=_cache,
+    interval_seconds=_settings.prefetch_interval_seconds,
+    lookback_hours=_settings.prefetch_lookback_hours,
+    live=_live_service,
+)
 
 
 def get_settings() -> Settings:
@@ -29,3 +37,7 @@ def get_historical_service() -> HistoricalService:
 
 def get_live_service() -> LiveSessionService:
     return _live_service
+
+
+def get_prefetch_scheduler() -> SessionPrefetchScheduler:
+    return _prefetch_scheduler

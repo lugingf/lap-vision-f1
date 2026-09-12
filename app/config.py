@@ -28,6 +28,9 @@ class Settings:
     data_cache_dir: Path
     live_data_dir: Path
     live_quantum_seconds: int
+    prefetch_enabled: bool
+    prefetch_interval_seconds: int
+    prefetch_lookback_hours: int
 
 
 def load_settings() -> Settings:
@@ -53,4 +56,7 @@ def load_settings() -> Settings:
             var_dir / "live-timing",
         ),
         live_quantum_seconds=max(1, int(os.getenv("LAP_VISION_F1_LIVE_QUANTUM_SECONDS", "5"))),
+        prefetch_enabled=os.getenv("LAP_VISION_F1_PREFETCH_ENABLED", "true").strip().lower() not in ("0", "false", ""),
+        prefetch_interval_seconds=max(60, int(os.getenv("LAP_VISION_F1_PREFETCH_INTERVAL_SECONDS", "300"))),
+        prefetch_lookback_hours=max(1, int(os.getenv("LAP_VISION_F1_PREFETCH_LOOKBACK_HOURS", "96"))),
     )

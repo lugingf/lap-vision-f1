@@ -123,11 +123,9 @@ EOF
   rm -f "${relay_unit_tmp}"
 
   sudo -n systemctl enable f1-proxy-relay >/dev/null 2>&1 || true
-  if [[ "${relay_changed}" -eq 1 ]] || ! sudo -n systemctl is-active --quiet f1-proxy-relay; then
-    log "(re)starting f1-proxy-relay"
-    sudo -n systemctl restart f1-proxy-relay
-  fi
+  relay_ready=1
 else
+  relay_ready=0
   log "no passwordless sudo available; skipping f1-proxy-relay systemd setup (see deploy/f1-proxy-relay.service)"
 fi
 
@@ -193,6 +191,16 @@ upstream f1_upstream {
     server ${APP_NAME}-${next_color}:${TARGET_PORT};
 }
 EOF
+
+# f1-proxy-relay registers the proxy list against whichever container is active when *it*
+# (re)starts (see f1-proxy-relay.sh). That container just changed, so restart it unconditionally
+# here - not only when the relay's own config changed - or a stale registration against the
+# previous container silently persists (proxy.json is shared, so nothing else would ever
+# overwrite it back to a valid state).
+if [[ "${relay_ready}" -eq 1 ]]; then
+  log "restarting f1-proxy-relay to re-register proxies against ${container_name}"
+  sudo -n systemctl restart f1-proxy-relay
+fi
 
 if [[ ! -f "${APP_ROOT}/shared/f1-proxy/nginx.conf" ]]; then
   cp "${SCRIPT_DIR}/nginx.internal.conf" "${APP_ROOT}/shared/f1-proxy/nginx.conf"

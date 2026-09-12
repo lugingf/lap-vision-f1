@@ -5,6 +5,7 @@ import math
 import os
 import random
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -63,6 +64,70 @@ def _import_fastf1(cache_dir: str):
     cache_path.mkdir(parents=True, exist_ok=True)
     fastf1.Cache.enable_cache(cache_path)
     return fastf1
+
+
+def _prewarm_session_cache(
+    session: Any, *, laps: bool, telemetry: bool, weather: bool, messages: bool
+) -> None:
+    """Fire the independent per-category F1 API fetches concurrently so the sequential
+    `session.load()` call right after this hits an already-warm cache for each of them.
+
+    Each category (session info, driver list, laps, car/position telemetry, weather, race
+    control) is its own independent HTTP GET against a different static file - fastf1 fetches
+    them one at a time. On a high-latency link (e.g. through an SSH/SOCKS proxy tunnel) that
+    makes wall-clock time roughly the *sum* of every fetch; overlapping them here cuts it to
+    roughly the *slowest single* fetch instead. car_data/position_data (the two large binary
+    telemetry streams) benefit the most.
+
+    Best-effort: any failure here is swallowed - session.load() will simply fetch normally
+    (and log its own warning) for whatever category didn't warm up in time.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from fastf1 import _api as f1api  # type: ignore
+
+    path = session.api_path
+    jobs: list[Callable[[], Any]] = [
+        lambda: f1api.session_info(path),
+        lambda: f1api.driver_info(path),
+    ]
+    if laps:
+        jobs += [
+            lambda: f1api._extended_timing_data(path),
+            lambda: f1api.timing_app_data(path),
+            lambda: f1api.track_status_data(path),
+            lambda: f1api.lap_count(path),
+            lambda: f1api.session_status_data(path),
+        ]
+    if telemetry:
+        jobs += [
+            lambda: f1api.car_data(path),
+            lambda: f1api.position_data(path),
+        ]
+    if weather:
+        jobs.append(lambda: f1api.weather_data(path))
+    if messages:
+        jobs.append(lambda: f1api.race_control_messages(path))
+
+    # fastf1's own rate limiter (fastf1.req._MinIntervalLimitDelay, >=0.25s between requests)
+    # has no lock: several threads dispatching at once can each see themselves as "first" and
+    # send within the same instant, defeating it. fastf1's maintainers are explicit that
+    # violating these limits can get the whole project blocked from an API - so respect the
+    # spacing ourselves by staggering *dispatch*, not by giving up on concurrency entirely. The
+    # two large, slow telemetry transfers (car_data/position_data) still overlap almost fully:
+    # their own multi-minute run time dwarfs a sub-second stagger between when each starts.
+    dispatch_interval = 0.25
+    with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+        futures = []
+        for index, job in enumerate(jobs):
+            if index > 0:
+                time.sleep(dispatch_interval)
+            futures.append(pool.submit(job))
+        for future in futures:
+            try:
+                future.result()
+            except Exception:  # noqa: BLE001 - best-effort warmup, session.load() re-fetches on miss
+                pass
 
 
 def _slugify_event(event: str | int) -> str:
@@ -596,6 +661,7 @@ def fetch_telemetry_compare_payload(
 
     def _load() -> Any:
         session = fastf1.get_session(request.year, request.event, request.session)
+        _prewarm_session_cache(session, laps=True, telemetry=True, weather=False, messages=False)
         session.load(
             laps=True,
             telemetry=True,
@@ -652,6 +718,7 @@ def fetch_race_playback_payload(
 
     def _load() -> Any:
         session = fastf1.get_session(request.year, request.event, request.session)
+        _prewarm_session_cache(session, laps=True, telemetry=True, weather=False, messages=False)
         session.load(
             laps=True,
             telemetry=True,
@@ -868,6 +935,13 @@ def fetch_session_payload(
 
     def _load() -> Any:
         session = fastf1.get_session(request.year, request.event, request.session)
+        _prewarm_session_cache(
+            session,
+            laps=request.include_laps,
+            telemetry=request.include_telemetry,
+            weather=request.include_weather,
+            messages=request.include_messages,
+        )
         session.load(
             laps=request.include_laps,
             telemetry=request.include_telemetry,

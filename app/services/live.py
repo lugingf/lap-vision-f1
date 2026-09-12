@@ -122,6 +122,12 @@ class LiveSessionService:
                 session=request.session,
             )
 
+    def is_running(self, year: int, event: str | int, session: str) -> bool:
+        live_session = self._sessions.get(
+            self._key(LiveSessionRequest(year=year, event=event, session=session))
+        )
+        return live_session is not None and live_session.process.is_alive()
+
     def status(self, request: LiveSessionRequest) -> LiveSessionStatus:
         live_session = self._sessions.get(self._key(request))
         if live_session is None:
