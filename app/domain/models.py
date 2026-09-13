@@ -40,6 +40,7 @@ class ScheduleEvent(BaseModel):
     official_event_name: str | None = None
     event_date: str | None = None
     session_names: list[str] = Field(default_factory=list)
+    is_today: bool = False
 
 
 class ScheduleResponse(BaseModel):

@@ -8,6 +8,7 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -142,6 +143,30 @@ def _slugify_event(event: str | int) -> str:
 
 def _cache_key_for_schedule(year: int) -> str:
     return f"schedule/{year}.json"
+
+
+def _with_is_today(schedule: ScheduleResponse) -> ScheduleResponse:
+    """Stamps each event's `is_today` fresh on every response, never from the cached payload
+    itself - the season schedule is cached for the whole year, so a value baked in at fetch
+    time would go stale the moment the calendar moves on to the next event weekend.
+
+    A race weekend's practice/qualifying sessions happen in the days *before* event_date
+    (usually the race day itself), so the window looks back further than it looks forward.
+    """
+    today = datetime.now(UTC).date()
+    for event in schedule.events:
+        event.is_today = _event_date_in_window(event.event_date, today, lookback_days=2, forward_days=1)
+    return schedule
+
+
+def _event_date_in_window(event_date: str | None, today: date, *, lookback_days: int, forward_days: int) -> bool:
+    if not event_date:
+        return False
+    try:
+        parsed = date.fromisoformat(event_date)
+    except ValueError:
+        return False
+    return today - timedelta(days=lookback_days) <= parsed <= today + timedelta(days=forward_days)
 
 
 def _cache_key_for_session(request: SessionRequest) -> str:
@@ -1165,7 +1190,7 @@ class HistoricalService:
             if cached is not None:
                 cached["cache_hit"] = True
                 cached["cache_key"] = cache_key
-                return ScheduleResponse.model_validate(cached)
+                return _with_is_today(ScheduleResponse.model_validate(cached))
 
         loop = asyncio.get_running_loop()
         payload = await loop.run_in_executor(
@@ -1174,7 +1199,7 @@ class HistoricalService:
         self.cache.write_json(cache_key, payload)
         payload["cache_hit"] = False
         payload["cache_key"] = cache_key
-        return ScheduleResponse.model_validate(payload)
+        return _with_is_today(ScheduleResponse.model_validate(payload))
 
     async def load_session(self, request: SessionRequest) -> SessionBundle:
         cache_key = _cache_key_for_session(request)
