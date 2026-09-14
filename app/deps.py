@@ -24,6 +24,7 @@ _prefetch_scheduler = SessionPrefetchScheduler(
     interval_seconds=_settings.prefetch_interval_seconds,
     lookback_hours=_settings.prefetch_lookback_hours,
     live=_live_service,
+    playback_detail_step_ms=_settings.prefetch_playback_detail_step_ms,
 )
 
 

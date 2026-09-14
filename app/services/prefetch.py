@@ -46,11 +46,13 @@ class SessionPrefetchScheduler:
         interval_seconds: int,
         lookback_hours: int,
         live: LiveSessionService | None = None,
+        playback_detail_step_ms: int = 0,
     ) -> None:
         self._historical = historical
         self._cache = cache
         self._interval_seconds = interval_seconds
         self._lookback_hours = lookback_hours
+        self._playback_detail_step_ms = playback_detail_step_ms
         self._live = live
         self._task: asyncio.Task[None] | None = None
 
@@ -172,6 +174,31 @@ class SessionPrefetchScheduler:
             got_playback = playback.available
         except Exception:
             _logger.exception("prefetch: race playback failed for %s round %s %s", year, round_number, session_name)
+
+        # The finer playback the scrubbing view asks for, warmed here rather than by whoever opens
+        # it first. Its cost is a full session load — the same as the coarse one — and paying it in
+        # the background is the difference between a view that opens and one that times out.
+        #
+        # Only for a session that actually has a playback: a cancelled or unrecorded session would
+        # otherwise be loaded twice to learn the same nothing.
+        if got_playback and self._playback_detail_step_ms > 0:
+            try:
+                await self._historical.race_playback(
+                    RacePlaybackRequest(
+                        year=year,
+                        event=round_number,
+                        session=session_name,
+                        sample_step_ms=self._playback_detail_step_ms,
+                        include_telemetry=False,
+                    )
+                )
+            except Exception:
+                _logger.exception(
+                    "prefetch: detailed race playback failed for %s round %s %s",
+                    year,
+                    round_number,
+                    session_name,
+                )
 
         had_data = got_laps or got_playback
         if not had_data:

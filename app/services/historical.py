@@ -195,15 +195,60 @@ def _cache_key_for_telemetry(request: TelemetryCompareRequest) -> str:
 
 
 def _cache_key_for_race_playback(request: RacePlaybackRequest) -> str:
+    """Where the whole race at this resolution lives.
+
+    The window is deliberately not part of the key. It used to be, and the cost was hidden: every
+    distinct window was a separate entry, a miss on it meant loading the whole session from FastF1
+    again, and that takes longer than any caller is willing to wait. So a scrubbing client — which
+    asks for a new window every time the slider moves — never hit the cache once and timed out on
+    every request. One entry per race and resolution; windows are cut out of it.
+    """
     event_slug = _slugify_event(request.event)
     session_slug = request.session.strip().lower()
-    window_suffix = ""
-    if request.window_start_ms is not None or request.window_end_ms is not None:
-        window_suffix = f"__{max(0, request.window_start_ms or 0)}-{max(0, request.window_end_ms or 0)}"
     return (
         f"playback/{request.year}/{event_slug}/{session_slug}/"
-        f"race-playback-v7-{max(100, request.sample_step_ms)}ms{window_suffix}.json"
+        f"race-playback-v8-{max(100, request.sample_step_ms)}ms.json"
     )
+
+
+def _slice_playback_window(
+    payload: dict[str, Any], window_start_ms: int | None, window_end_ms: int | None, sample_step_ms: int
+) -> dict[str, Any]:
+    """One window of a full-race payload, without touching the cached original.
+
+    A sample step either side of the asked-for range is kept on purpose: the client interpolates
+    between samples, and a window cut exactly to its own edges leaves it nothing to interpolate
+    towards at the ends.
+    """
+    if window_start_ms is None and window_end_ms is None:
+        return payload
+    if not payload.get("available"):
+        return payload
+
+    low = None if window_start_ms is None else max(0, window_start_ms - sample_step_ms)
+    high = None if window_end_ms is None else max(0, window_end_ms + sample_step_ms)
+
+    sliced = dict(payload)
+    drivers = []
+    for driver in payload.get("drivers") or []:
+        samples = [
+            sample
+            for sample in driver.get("samples") or []
+            if (low is None or sample["time_ms"] >= low) and (high is None or sample["time_ms"] <= high)
+        ]
+        entry = dict(driver)
+        entry["samples"] = samples
+        drivers.append(entry)
+
+    sliced["drivers"] = drivers
+    # The window the caller asked for, not the extent of the race: the client positions its slider
+    # from these, and reporting the whole race would put it outside what it was given.
+    if low is not None:
+        sliced["window_start_ms"] = low
+    if high is not None:
+        sliced["window_end_ms"] = high
+
+    return sliced
 
 
 def _to_iso(value: Any) -> str | None:
@@ -1246,27 +1291,40 @@ class HistoricalService:
         return TelemetryCompareResponse.model_validate(payload)
 
     async def race_playback(self, request: RacePlaybackRequest) -> RacePlaybackResponse:
-        cache_key = _cache_key_for_race_playback(request)
+        # What is computed and cached is always the whole race; the window is cut from it on the
+        # way out. Computing a window on its own means loading the session from FastF1 for that
+        # window alone, which costs the same as the whole race and is thrown away just as fast.
+        whole_race = request.model_copy(update={"window_start_ms": None, "window_end_ms": None})
+        sample_step_ms = max(100, request.sample_step_ms)
+        cache_key = _cache_key_for_race_playback(whole_race)
+
         if not request.refresh:
             cached = self.cache.read_json(cache_key)
             if cached is not None:
                 if cached.get("available") is False:
                     cached = None
                 else:
-                    cached["cache_hit"] = True
-                    cached["cache_key"] = cache_key
-                    return RacePlaybackResponse.model_validate(cached)
+                    sliced = _slice_playback_window(
+                        cached, request.window_start_ms, request.window_end_ms, sample_step_ms
+                    )
+                    sliced["cache_hit"] = True
+                    sliced["cache_key"] = cache_key
+                    return RacePlaybackResponse.model_validate(sliced)
 
         loop = asyncio.get_running_loop()
         payload = await loop.run_in_executor(
             self.executor,
             fetch_race_playback_payload,
-            request.model_dump(mode="json"),
+            whole_race.model_dump(mode="json"),
             str(self.fastf1_cache_dir),
             self.get_proxy_urls(),
         )
         if payload.get("available") is not False:
             self.cache.write_json(cache_key, payload)
-        payload["cache_hit"] = False
-        payload["cache_key"] = cache_key
-        return RacePlaybackResponse.model_validate(payload)
+
+        sliced = _slice_playback_window(
+            payload, request.window_start_ms, request.window_end_ms, sample_step_ms
+        )
+        sliced["cache_hit"] = False
+        sliced["cache_key"] = cache_key
+        return RacePlaybackResponse.model_validate(sliced)

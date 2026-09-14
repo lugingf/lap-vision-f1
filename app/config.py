@@ -31,6 +31,7 @@ class Settings:
     prefetch_enabled: bool
     prefetch_interval_seconds: int
     prefetch_lookback_hours: int
+    prefetch_playback_detail_step_ms: int
 
 
 def load_settings() -> Settings:
@@ -59,4 +60,10 @@ def load_settings() -> Settings:
         prefetch_enabled=os.getenv("LAP_VISION_F1_PREFETCH_ENABLED", "true").strip().lower() not in ("0", "false", ""),
         prefetch_interval_seconds=max(60, int(os.getenv("LAP_VISION_F1_PREFETCH_INTERVAL_SECONDS", "300"))),
         prefetch_lookback_hours=max(1, int(os.getenv("LAP_VISION_F1_PREFETCH_LOOKBACK_HOURS", "96"))),
+        # The finer playback the scrubbing view asks for. Warmed in the background because the
+        # first caller otherwise pays for a full session load; 0 switches the warming off, for a
+        # deployment that would rather have the disk than the wait.
+        prefetch_playback_detail_step_ms=max(
+            0, int(os.getenv("LAP_VISION_F1_PREFETCH_PLAYBACK_DETAIL_STEP_MS", "250"))
+        ),
     )
