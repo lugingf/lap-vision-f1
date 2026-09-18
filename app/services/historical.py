@@ -1215,6 +1215,42 @@ class HistoricalService:
         self.cache = cache
         self.executor = ProcessPoolExecutor(max_workers=worker_processes)
         self._proxy_lock = threading.Lock()
+        # What is being computed right now, by cache key.
+        #
+        # Loading a session FastF1 has not seen takes minutes, and the caller rarely waits that
+        # long: the request dies at a proxy or a browser, but the pool task does not, because a
+        # running process-pool job cannot be cancelled. The next attempt for the same session then
+        # submitted a second job for exactly the work already under way, and with two worker
+        # processes it took three impatient readers to fill the pool with duplicates of one
+        # computation. Now they all wait on the same task.
+        self._in_flight: dict[str, asyncio.Future[Any]] = {}
+
+    async def _compute_once(self, cache_key: str, fetch: Callable[..., Any], *args: Any) -> dict[str, Any]:
+        """Run one computation per cache key, however many callers ask for it.
+
+        The work belongs to the service rather than to the request that started it: a reader who
+        gives up must not cancel what the next reader is about to ask for, and — since a running
+        process-pool job cannot be cancelled anyway — a second submission would only mean the same
+        session being loaded twice at once.
+        """
+        pending = self._in_flight.get(cache_key)
+        if pending is None or pending.done():
+            pending = self._submit(fetch, *args)
+            self._in_flight[cache_key] = pending
+
+            def _forget(finished: asyncio.Future[Any], key: str = cache_key) -> None:
+                if self._in_flight.get(key) is finished:
+                    del self._in_flight[key]
+
+            pending.add_done_callback(_forget)
+
+        return await asyncio.shield(pending)
+
+    def _submit(self, fetch: Callable[..., Any], *args: Any) -> asyncio.Future[Any]:
+        """Hand one fetch to the worker processes."""
+        loop = asyncio.get_running_loop()
+
+        return asyncio.ensure_future(loop.run_in_executor(self.executor, fetch, *args))
 
     def get_proxy_urls(self) -> list[str]:
         with self._proxy_lock:
@@ -1237,9 +1273,8 @@ class HistoricalService:
                 cached["cache_key"] = cache_key
                 return _with_is_today(ScheduleResponse.model_validate(cached))
 
-        loop = asyncio.get_running_loop()
-        payload = await loop.run_in_executor(
-            self.executor, fetch_schedule_payload, year, str(self.fastf1_cache_dir), self.get_proxy_urls()
+        payload = await self._compute_once(
+            cache_key, fetch_schedule_payload, year, str(self.fastf1_cache_dir), self.get_proxy_urls()
         )
         self.cache.write_json(cache_key, payload)
         payload["cache_hit"] = False
@@ -1255,9 +1290,8 @@ class HistoricalService:
                 cached["cache_key"] = cache_key
                 return SessionBundle.model_validate(cached)
 
-        loop = asyncio.get_running_loop()
-        payload = await loop.run_in_executor(
-            self.executor,
+        payload = await self._compute_once(
+            cache_key,
             fetch_session_payload,
             request.model_dump(),
             str(self.fastf1_cache_dir),
@@ -1277,9 +1311,8 @@ class HistoricalService:
                 cached["cache_key"] = cache_key
                 return TelemetryCompareResponse.model_validate(cached)
 
-        loop = asyncio.get_running_loop()
-        payload = await loop.run_in_executor(
-            self.executor,
+        payload = await self._compute_once(
+            cache_key,
             fetch_telemetry_compare_payload,
             request.model_dump(mode="json"),
             str(self.fastf1_cache_dir),
@@ -1311,9 +1344,8 @@ class HistoricalService:
                     sliced["cache_key"] = cache_key
                     return RacePlaybackResponse.model_validate(sliced)
 
-        loop = asyncio.get_running_loop()
-        payload = await loop.run_in_executor(
-            self.executor,
+        payload = await self._compute_once(
+            cache_key,
             fetch_race_playback_payload,
             whole_race.model_dump(mode="json"),
             str(self.fastf1_cache_dir),

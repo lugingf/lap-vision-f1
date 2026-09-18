@@ -1,7 +1,19 @@
+import asyncio
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from app.config import load_settings
+
+
+class _DummyCache:
+    """A cache that holds nothing, for tests about what is computed rather than what is stored."""
+
+    def read_json(self, _key: str):
+        return None
+
+    def write_json(self, _key: str, _payload) -> None:
+        pass
 
 
 class _DummyExecutor:
@@ -118,3 +130,85 @@ class RacePlaybackWindowTests(unittest.TestCase):
 
         payload = {"available": False, "message": "no position data"}
         self.assertIs(_slice_playback_window(payload, 0, 1000, 1000), payload)
+
+
+class InFlightComputationTests(unittest.IsolatedAsyncioTestCase):
+    """One computation per cache key, however many callers ask for it.
+
+    A session FastF1 has not loaded takes minutes, and the reader rarely waits: the request dies
+    at a proxy or a browser, but the process-pool job does not, because a running one cannot be
+    cancelled. Every further attempt used to submit a second job for the work already under way,
+    and with two worker processes a few impatient readers filled the pool with duplicates of one
+    computation — which is what made the site slow exactly when it was already slow.
+    """
+
+    def _service(self):
+        from app.services.historical import HistoricalService
+
+        with patch("app.services.historical.ProcessPoolExecutor", _DummyExecutor):
+            service = HistoricalService(Path("/tmp/fastf1"), _DummyCache(), worker_processes=2)
+
+        return service
+
+    async def test_concurrent_callers_share_one_computation(self) -> None:
+        service = self._service()
+        started = 0
+        release = asyncio.Event()
+
+        async def slow() -> dict:
+            nonlocal started
+            started += 1
+            await release.wait()
+            return {"ok": True}
+
+        def submit(*_args):
+            return asyncio.ensure_future(slow())
+
+        with patch.object(service, "_submit", side_effect=submit):
+            waiters = [asyncio.ensure_future(service._compute_once("key", object())) for _ in range(4)]
+            await asyncio.sleep(0)
+            release.set()
+            results = await asyncio.gather(*waiters)
+
+        self.assertEqual(started, 1, "the same session was computed more than once")
+        self.assertEqual(results, [{"ok": True}] * 4)
+
+    async def test_a_caller_giving_up_does_not_cancel_the_work(self) -> None:
+        service = self._service()
+        finished = asyncio.Event()
+
+        async def slow() -> dict:
+            try:
+                await asyncio.sleep(0.05)
+            except asyncio.CancelledError:
+                raise
+            finished.set()
+            return {"ok": True}
+
+        def submit(*_args):
+            return asyncio.ensure_future(slow())
+
+        with patch.object(service, "_submit", side_effect=submit):
+            giving_up = asyncio.ensure_future(service._compute_once("key", object()))
+            await asyncio.sleep(0)
+            giving_up.cancel()
+
+            await asyncio.wait_for(finished.wait(), timeout=1)
+
+    async def test_a_later_caller_starts_a_fresh_computation(self) -> None:
+        service = self._service()
+        started = 0
+
+        async def quick() -> dict:
+            nonlocal started
+            started += 1
+            return {"ok": True}
+
+        def submit(*_args):
+            return asyncio.ensure_future(quick())
+
+        with patch.object(service, "_submit", side_effect=submit):
+            await service._compute_once("key", object())
+            await service._compute_once("key", object())
+
+        self.assertEqual(started, 2, "a finished computation was reused instead of being redone")

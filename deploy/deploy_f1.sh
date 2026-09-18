@@ -202,9 +202,11 @@ if [[ "${relay_ready}" -eq 1 ]]; then
   sudo -n systemctl restart f1-proxy-relay
 fi
 
-if [[ ! -f "${APP_ROOT}/shared/f1-proxy/nginx.conf" ]]; then
-  cp "${SCRIPT_DIR}/nginx.internal.conf" "${APP_ROOT}/shared/f1-proxy/nginx.conf"
-fi
+# Rewritten on every deploy, so this repository is where the router's configuration lives.
+# Copying it only when the file was absent meant it was installed once and then frozen: the
+# version on the server stayed as it was on the day the host was set up, and a change here — a
+# proxy timeout, say — reached production only if somebody edited the file by hand.
+cp "${SCRIPT_DIR}/nginx.internal.conf" "${APP_ROOT}/shared/f1-proxy/nginx.conf"
 
 if docker ps --format '{{.Names}}' | grep -qx "${ROUTER_NAME}"; then
   docker exec "${ROUTER_NAME}" nginx -s reload >/dev/null
