@@ -110,6 +110,9 @@ class LapRow(BaseModel):
     is_pit_in_lap: bool = False
     deleted: bool = False
     position: int | None = None
+    speed_trap_kmh: float | None = None
+    pit_in_time_ms: int | None = None
+    pit_out_time_ms: int | None = None
 
 
 class StintRow(BaseModel):

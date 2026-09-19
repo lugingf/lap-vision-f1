@@ -1101,6 +1101,9 @@ def _session_to_bundle_payload(session: Any, request: SessionRequest) -> dict[st
                     "is_pit_in_lap": bool(row.get("PitInTime") is not None),
                     "deleted": bool(row.get("Deleted") or False),
                     "position": _to_int(row.get("Position")),
+                    "speed_trap_kmh": _to_float(row.get("SpeedST")),
+                    "pit_in_time_ms": _timedelta_to_ms(row.get("PitInTime")),
+                    "pit_out_time_ms": _timedelta_to_ms(row.get("PitOutTime")),
                 }
             )
 
