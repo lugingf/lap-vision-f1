@@ -15,6 +15,15 @@ _logger = logging.getLogger("lap-vision-f1.prefetch")
 _STATE_KEY = "runtime/prefetch-state.json"
 _MAX_ATTEMPTS = 12
 _POST_SESSION_BUFFER = timedelta(minutes=45)
+# The floor between two attempts at the same session, whether or not this tick's miss counts
+# against `_MAX_ATTEMPTS`. A session too early to have data yet was being retried every tick
+# (every `interval_seconds`, 5 minutes by default) with no backoff at all for as long as it stayed
+# outside the give-up budget - unbounded, since "too early" is explicitly exempted from that
+# budget. Multiplied across every session of every event in the lookback window, each retry being
+# several FastF1-backed calls, that alone was enough to exhaust FastF1's own 500-calls/hour limiter
+# well before any of those sessions could possibly have had data - see the incident this comment
+# was added for: round 15's Race, prefetched every five minutes for a day ahead of the race itself.
+_RETRY_COOLDOWN = timedelta(hours=1)
 
 
 class SessionPrefetchScheduler:
@@ -26,7 +35,9 @@ class SessionPrefetchScheduler:
     session of any event within `lookback_hours` of now, and remembers (on the same shared cache
     volume used everywhere else) which ones already returned real data so it stops re-fetching
     them. A session that never gets real data (cancelled, or the schedule is wrong) is retried at
-    most `_MAX_ATTEMPTS` times before being left alone.
+    most `_MAX_ATTEMPTS` times before being left alone. A session too early to have data yet is
+    exempt from that budget, but is still bound by `_RETRY_COOLDOWN`: "free" does not mean
+    "unlimited", or a session days away from running gets re-attempted on every tick until it is.
 
     Runs one session at a time, never in parallel with itself, and reuses the exact same
     fetch path (and its rate-limit-respecting concurrent-prewarm) as a normal user request - so
@@ -99,8 +110,11 @@ class SessionPrefetchScheduler:
                 if self._live is not None and self._live.is_running(now.year, event.round_number, session_name):
                     _logger.info("prefetch: skipping %s, live recording is active", key)
                     continue
+                if self._on_cooldown(entry, now):
+                    continue
 
                 done, had_data = await self._prefetch_one(now.year, event.round_number, session_name)
+                entry["last_attempt_at"] = now.isoformat()
                 if had_data:
                     # The session exists and is returning something - either still in progress
                     # (not `done` yet) or just finished. Either way this isn't a "session that
@@ -109,7 +123,8 @@ class SessionPrefetchScheduler:
                 elif event_date is not None and now.date() >= event_date:
                     # No data yet, but the session's day has arrived - this is a real miss.
                     entry["attempts"] = entry.get("attempts", 0) + 1
-                # else: too early for this session to have data yet - free retry, no penalty.
+                # else: too early for this session to have data yet - free retry, no penalty. Still
+                # subject to the cooldown above, so "no penalty" no longer means "no limit" either.
                 entry["done"] = done
                 state[key] = entry
                 self._save_state(state)
@@ -136,6 +151,19 @@ class SessionPrefetchScheduler:
         # Practice/qualifying happen in the days before event_date (usually the race day), so
         # look back the configured window as well as a day ahead in case of timezone edge cases.
         return today - timedelta(days=lookback_days) <= event_date <= today + timedelta(days=1)
+
+    @staticmethod
+    def _on_cooldown(entry: dict[str, Any], now: datetime) -> bool:
+        last_attempt_iso = entry.get("last_attempt_at")
+        if not last_attempt_iso:
+            return False
+        try:
+            last_attempt = datetime.fromisoformat(last_attempt_iso)
+        except ValueError:
+            return False
+        if last_attempt.tzinfo is None:
+            last_attempt = last_attempt.replace(tzinfo=UTC)
+        return now - last_attempt < _RETRY_COOLDOWN
 
     async def _prefetch_one(self, year: int, round_number: int, session_name: str) -> tuple[bool, bool]:
         """Returns (done, had_data). `done` only turns True once the session's own scheduled end
