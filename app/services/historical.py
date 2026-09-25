@@ -169,6 +169,20 @@ def _event_date_in_window(event_date: str | None, today: date, *, lookback_days:
     return today - timedelta(days=lookback_days) <= parsed <= today + timedelta(days=forward_days)
 
 
+def _session_bundle_has_data(payload: dict[str, Any]) -> bool:
+    """Whether a session payload actually has anything in it.
+
+    FastF1 wraps each sub-loader (session info, laps, telemetry, weather, messages) in its own
+    `@soft_exceptions` handler: a failure there - including hitting FastF1's own rate limiter -
+    is caught internally, logged, and left as an empty result rather than raised. `session.load()`
+    then returns normally, and nothing here can tell "genuinely nothing happened yet" apart from
+    "a sub-loader silently failed". Caching that as if it were the real answer would make the
+    empty result permanent - see race_playback's identical `available` check just below, which
+    this mirrors for the same reason.
+    """
+    return bool(payload.get("drivers")) or bool(payload.get("laps")) or bool(payload.get("results"))
+
+
 def _cache_key_for_session(request: SessionRequest) -> str:
     event_slug = _slugify_event(request.event)
     session_slug = request.session.strip().lower()
@@ -1288,7 +1302,11 @@ class HistoricalService:
         cache_key = _cache_key_for_session(request)
         if not request.refresh:
             cached = self.cache.read_json(cache_key)
-            if cached is not None:
+            # An empty result already on disk is not trusted as final either - it may predate
+            # this check, from exactly the kind of silently-swallowed failure it now guards
+            # against. Treating it as a miss lets the next request retry for real instead of
+            # replaying the same empty answer forever.
+            if cached is not None and _session_bundle_has_data(cached):
                 cached["cache_hit"] = True
                 cached["cache_key"] = cache_key
                 return SessionBundle.model_validate(cached)
@@ -1300,7 +1318,8 @@ class HistoricalService:
             str(self.fastf1_cache_dir),
             self.get_proxy_urls(),
         )
-        self.cache.write_json(cache_key, payload)
+        if _session_bundle_has_data(payload):
+            self.cache.write_json(cache_key, payload)
         payload["cache_hit"] = False
         payload["cache_key"] = cache_key
         return SessionBundle.model_validate(payload)
