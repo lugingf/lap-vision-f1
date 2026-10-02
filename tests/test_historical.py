@@ -1,6 +1,15 @@
 import unittest
+from datetime import datetime, timedelta, timezone
+from unittest import mock
 
-from app.services.historical import _session_bundle_has_data
+import pandas as pd  # type: ignore
+
+from app.services.historical import (
+    _schedule_session_start,
+    _session_bundle_has_data,
+    _utc_iso,
+    fetch_schedule_payload,
+)
 
 
 class SessionBundleHasDataTests(unittest.TestCase):
@@ -25,6 +34,101 @@ class SessionBundleHasDataTests(unittest.TestCase):
 
     def test_results_alone_counts_as_data(self) -> None:
         self.assertTrue(_session_bundle_has_data({"drivers": [], "laps": [], "results": [{"position": 1}]}))
+
+
+class ScheduleTimesTests(unittest.TestCase):
+    """The official start of a session, always in UTC.
+
+    FastF1 gives Session{N}DateUtc as a naive datetime that is already UTC and Session{N}Date as a
+    local time with an offset. Mixing the two up moves a session by the circuit's offset - hours
+    from where it really is - so each reading is pinned here."""
+
+    def test_a_naive_datetime_is_read_as_utc(self) -> None:
+        self.assertEqual(_utc_iso(pd.Timestamp("2026-10-02 08:00:00")), "2026-10-02T08:00:00Z")
+
+    def test_an_aware_datetime_is_converted_to_utc(self) -> None:
+        local = datetime(2026, 10, 2, 16, 0, tzinfo=timezone(timedelta(hours=8)))
+        self.assertEqual(_utc_iso(local), "2026-10-02T08:00:00Z")
+
+    def test_a_date_that_crosses_midnight_in_utc_changes_day(self) -> None:
+        local = datetime(2026, 10, 3, 2, 0, tzinfo=timezone(timedelta(hours=8)))
+        self.assertEqual(_utc_iso(local), "2026-10-02T18:00:00Z")
+
+    def test_a_missing_moment_is_none(self) -> None:
+        self.assertIsNone(_utc_iso(None))
+        self.assertIsNone(_utc_iso(pd.NaT))
+
+    def test_the_utc_column_wins_over_the_local_one(self) -> None:
+        row = {
+            "Session2DateUtc": pd.Timestamp("2026-10-02 08:00:00"),
+            "Session2Date": pd.Timestamp("2026-10-02 16:00:00", tz="Asia/Kuala_Lumpur"),
+        }
+        self.assertEqual(_schedule_session_start(row, "2"), "2026-10-02T08:00:00Z")
+
+    def test_a_local_time_with_an_offset_is_used_when_there_is_no_utc_column(self) -> None:
+        row = {"Session2Date": pd.Timestamp("2026-10-02 16:00:00", tz="Asia/Kuala_Lumpur")}
+        self.assertEqual(_schedule_session_start(row, "2"), "2026-10-02T08:00:00Z")
+
+    def test_a_local_time_without_an_offset_is_not_guessed_at(self) -> None:
+        row = {"Session2Date": pd.Timestamp("2026-10-02 16:00:00")}
+        self.assertIsNone(_schedule_session_start(row, "2"))
+
+
+class FetchSchedulePayloadTests(unittest.TestCase):
+    def _payload(self, frame: pd.DataFrame) -> dict:
+        fastf1 = mock.Mock()
+        fastf1.get_event_schedule.return_value = frame
+        with mock.patch("app.services.historical._import_fastf1", return_value=fastf1):
+            return fetch_schedule_payload(2026, "/tmp/unused")
+
+    def test_every_named_session_carries_its_start_in_utc(self) -> None:
+        frame = pd.DataFrame(
+            [
+                {
+                    "RoundNumber": 16,
+                    "EventName": "Bahrain Grand Prix",
+                    "EventFormat": "conventional",
+                    "EventDate": pd.Timestamp("2026-10-04"),
+                    "Session1": "Practice 1",
+                    "Session1Date": pd.Timestamp("2026-10-02 12:30:00", tz="Asia/Kuala_Lumpur"),
+                    "Session1DateUtc": pd.Timestamp("2026-10-02 04:30:00"),
+                    "Session2": "Practice 2",
+                    "Session2Date": pd.Timestamp("2026-10-02 16:00:00", tz="Asia/Kuala_Lumpur"),
+                    "Session2DateUtc": pd.Timestamp("2026-10-02 08:00:00"),
+                    "Session3": None,
+                    "Session3Date": pd.NaT,
+                    "Session3DateUtc": pd.NaT,
+                }
+            ]
+        )
+
+        event = self._payload(frame)["events"][0]
+
+        self.assertEqual(event["session_names"], ["Practice 1", "Practice 2"])
+        self.assertEqual(
+            event["sessions"],
+            [
+                {"session_name": "Practice 1", "starts_at": "2026-10-02T04:30:00Z"},
+                {"session_name": "Practice 2", "starts_at": "2026-10-02T08:00:00Z"},
+            ],
+        )
+
+    def test_a_session_without_a_time_is_still_listed(self) -> None:
+        frame = pd.DataFrame(
+            [
+                {
+                    "RoundNumber": 1,
+                    "EventName": "Australian Grand Prix",
+                    "EventDate": pd.Timestamp("2026-03-08"),
+                    "Session1": "Practice 1",
+                    "Session1DateUtc": pd.NaT,
+                }
+            ]
+        )
+
+        event = self._payload(frame)["events"][0]
+
+        self.assertEqual(event["sessions"], [{"session_name": "Practice 1", "starts_at": None}])
 
 
 if __name__ == "__main__":

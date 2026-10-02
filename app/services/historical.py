@@ -4,6 +4,7 @@ import asyncio
 import math
 import os
 import random
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -966,6 +967,48 @@ def fetch_race_playback_payload(
     return response
 
 
+def _utc_iso(value: Any) -> str | None:
+    """A moment as ISO 8601 in UTC with a trailing Z, or None when there is no moment.
+
+    FastF1 gives a session twice: Session{N}Date is the local wall-clock time with its offset, and
+    Session{N}DateUtc is the same moment as a *naive* datetime that is already in UTC. A naive value
+    is therefore read as UTC and an aware one is converted to it - never the other way round, which
+    would read the circuit's local time as UTC and be off by the circuit's offset.
+    """
+    import pandas as pd  # type: ignore
+
+    if value is None or pd.isna(value):
+        return None
+    try:
+        stamp = pd.Timestamp(value)
+    except (TypeError, ValueError):
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.tz_localize("UTC")
+    else:
+        stamp = stamp.tz_convert("UTC")
+
+    return stamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _schedule_session_start(row: Any, index: str) -> str | None:
+    """The official start of session number `index` of an event row, in UTC.
+
+    Session{N}DateUtc is preferred. The local Session{N}Date is used only when it carries its
+    offset: a local time without one cannot be turned into UTC, and a guess would put the session
+    hours away from where it is.
+    """
+    utc = _utc_iso(row.get(f"Session{index}DateUtc"))
+    if utc is not None:
+        return utc
+
+    local = row.get(f"Session{index}Date")
+    if local is not None and getattr(local, "tzinfo", None) is not None:
+        return _utc_iso(local)
+
+    return None
+
+
 def fetch_schedule_payload(year: int, cache_dir: str, proxy_urls: list[str] | None = None) -> dict[str, Any]:
     fastf1 = _import_fastf1(cache_dir)
 
@@ -973,16 +1016,21 @@ def fetch_schedule_payload(year: int, cache_dir: str, proxy_urls: list[str] | No
 
     schedule = _with_proxy_pool(proxy_urls, lambda: fastf1.get_event_schedule(year, include_testing=False))
     events: list[dict[str, Any]] = []
-    session_columns = [
-        column for column in schedule.columns if column.startswith("Session") and not column.endswith("Date")
-    ]
+    session_columns = [column for column in schedule.columns if re.fullmatch(r"Session\d+", column)]
 
     for _, row in schedule.iterrows():
         session_names = []
+        sessions = []
         for column in session_columns:
             value = row.get(column)
             if isinstance(value, str) and value.strip():
                 session_names.append(value.strip())
+                sessions.append(
+                    {
+                        "session_name": value.strip(),
+                        "starts_at": _schedule_session_start(row, column.removeprefix("Session")),
+                    }
+                )
 
         event_date = row.get("EventDate")
         if pd.notna(event_date) and hasattr(event_date, "isoformat"):
@@ -1001,6 +1049,7 @@ def fetch_schedule_payload(year: int, cache_dir: str, proxy_urls: list[str] | No
                 "official_event_name": row.get("OfficialEventName"),
                 "event_date": event_date_value,
                 "session_names": session_names,
+                "sessions": sessions,
             }
         )
 
