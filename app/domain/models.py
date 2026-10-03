@@ -30,6 +30,14 @@ class ServiceOverview(BaseModel):
     notes: list[str]
 
 
+class ScheduleSession(BaseModel):
+    """One session of an event as the calendar gives it: its name and its official start in UTC.
+    The start is None for a session the calendar does not time."""
+
+    session_name: str
+    starts_at: str | None = None
+
+
 class ScheduleEvent(BaseModel):
     season_year: int
     round_number: int
@@ -40,6 +48,9 @@ class ScheduleEvent(BaseModel):
     official_event_name: str | None = None
     event_date: str | None = None
     session_names: list[str] = Field(default_factory=list)
+    # Without this the response model dropped the session times the schedule fetch had read, and
+    # the callers saw only names: no start time could be shown or stored for a session not run yet.
+    sessions: list[ScheduleSession] = Field(default_factory=list)
     is_today: bool = False
 
 

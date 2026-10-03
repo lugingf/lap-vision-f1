@@ -131,5 +131,37 @@ class FetchSchedulePayloadTests(unittest.TestCase):
         self.assertEqual(event["sessions"], [{"session_name": "Practice 1", "starts_at": None}])
 
 
+class ScheduleResponseKeepsSessionTimesTest(unittest.TestCase):
+    """The schedule is read with the start of each session, and the API must say it too: a model
+    that does not name the field drops it, and the callers see only session names."""
+
+    def test_the_response_carries_the_start_of_each_session(self) -> None:
+        from app.domain.models import ScheduleResponse
+
+        response = ScheduleResponse.model_validate(
+            {
+                "season_year": 2026,
+                "events": [
+                    {
+                        "season_year": 2026,
+                        "round_number": 16,
+                        "event_name": "Bahrain Grand Prix",
+                        "session_names": ["Practice 1", "Race"],
+                        "sessions": [
+                            {"session_name": "Practice 1", "starts_at": "2026-10-02T04:30:00Z"},
+                            {"session_name": "Race", "starts_at": None},
+                        ],
+                    }
+                ],
+                "cache_hit": True,
+                "cache_key": "schedule/2026.json",
+            }
+        )
+
+        dumped = response.model_dump()["events"][0]["sessions"]
+        self.assertEqual(dumped[0], {"session_name": "Practice 1", "starts_at": "2026-10-02T04:30:00Z"})
+        self.assertIsNone(dumped[1]["starts_at"])
+
+
 if __name__ == "__main__":
     unittest.main()
