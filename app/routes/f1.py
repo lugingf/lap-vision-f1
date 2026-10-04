@@ -4,6 +4,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from app.config import Settings
 from app.deps import get_historical_service, get_live_service, get_settings
@@ -206,3 +207,120 @@ async def live_session_snapshot(
         return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content={"detail": "no snapshot available yet"})
     payload = {**payload, "cache_hit": False, "cache_key": "live"}
     return SessionBundle.model_validate(payload)
+
+
+def _live_request(year: int, event: str, session: str) -> LiveSessionRequest:
+    return LiveSessionRequest(year=year, event=event, session=session)
+
+
+@router.get("/v1/live/sessions/state", dependencies=[Depends(require_internal_token)])
+async def live_session_state(
+    live_service: LiveServiceDep,
+    year: int = Query(...),
+    event: str = Query(...),
+    session: str = Query(...),
+) -> JSONResponse:
+    """Everything a live screen draws, as the feed has described the session so far. 202 while there
+    is nothing recorded for the session."""
+    payload = live_service.state(_live_request(year, event, session))
+    if payload is None:
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED, content={"detail": "no live recording for this session"}
+        )
+    return JSONResponse(content=payload)
+
+
+@router.get("/v1/live/sessions/telemetry", dependencies=[Depends(require_internal_token)])
+async def live_session_telemetry(
+    live_service: LiveServiceDep,
+    year: int = Query(...),
+    event: str = Query(...),
+    session: str = Query(...),
+    driver: str = Query(..., description="The driver's racing number"),
+    seconds: int = Query(60, ge=5, le=180),
+    lap: bool = Query(False),
+) -> JSONResponse:
+    payload = live_service.telemetry(_live_request(year, event, session), driver, seconds, lap)
+    if payload is None:
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED, content={"detail": "no live recording for this session"}
+        )
+    return JSONResponse(content=payload)
+
+
+@router.get("/v1/live/sessions/trails", dependencies=[Depends(require_internal_token)])
+async def live_session_trails(
+    live_service: LiveServiceDep,
+    year: int = Query(...),
+    event: str = Query(...),
+    session: str = Query(...),
+    seconds: int = Query(20, ge=1, le=120),
+) -> JSONResponse:
+    payload = live_service.trails(_live_request(year, event, session), seconds)
+    if payload is None:
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED, content={"detail": "no live recording for this session"}
+        )
+    return JSONResponse(content=payload)
+
+
+@router.get("/v1/live/sessions/outline", dependencies=[Depends(require_internal_token)])
+async def live_session_outline(
+    live_service: LiveServiceDep,
+    year: int = Query(...),
+    event: str = Query(...),
+    session: str = Query(...),
+) -> JSONResponse:
+    """The circuit as the cars have drawn it, for the map of a session that is being run."""
+    payload = live_service.outline(_live_request(year, event, session))
+    if payload is None:
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED, content={"detail": "no live recording for this session"}
+        )
+    return JSONResponse(content=payload)
+
+
+@router.get("/v1/live/sessions/history", dependencies=[Depends(require_internal_token)])
+async def live_session_history(
+    live_service: LiveServiceDep,
+    year: int = Query(...),
+    event: str = Query(...),
+    session: str = Query(...),
+) -> JSONResponse:
+    """Lap by lap, per driver, for the charts of a race that is being run."""
+    payload = live_service.history(_live_request(year, event, session))
+    if payload is None:
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED, content={"detail": "no live recording for this session"}
+        )
+    return JSONResponse(content=payload)
+
+
+class LiveReplayRequest(BaseModel):
+    year: int
+    event: str
+    session: str
+    file: str
+    speed: float = 1.0
+
+
+@router.post(
+    "/v1/live/sessions/replay",
+    response_model=LiveSessionStatus,
+    dependencies=[Depends(require_internal_token)],
+)
+async def replay_live_session(
+    request: LiveReplayRequest,
+    live_service: LiveServiceDep,
+    settings: SettingsDep,
+) -> LiveSessionStatus:
+    """Play a recording from the live-data directory back as if it were arriving. Only where it has
+    been switched on: it is for trying the screen, and has no business on a production service."""
+    if not settings.live_replay_enabled:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="replay is not enabled")
+    source = (settings.live_data_dir / request.file).resolve()
+    if settings.live_data_dir.resolve() not in source.parents or not source.is_file():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no such recording")
+    return await live_service.replay(
+        LiveSessionRequest(year=request.year, event=request.event, session=request.session), source, request.speed
+    )

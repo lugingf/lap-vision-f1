@@ -17,6 +17,8 @@ _live_service = LiveSessionService(
     historical=_historical_service,
     live_data_dir=_settings.live_data_dir,
     quantum_seconds=_settings.live_quantum_seconds,
+    token_file=_settings.f1tv_token_file,
+    snapshot_enabled=_settings.live_snapshot_enabled,
 )
 _prefetch_scheduler = SessionPrefetchScheduler(
     historical=_historical_service,

@@ -69,9 +69,7 @@ class RacePlaybackWindowTests(unittest.TestCase):
         from app.services.historical import _cache_key_for_race_playback
 
         whole = _cache_key_for_race_playback(self._request())
-        windowed = _cache_key_for_race_playback(
-            self._request(window_start_ms=1_800_000, window_end_ms=1_810_000)
-        )
+        windowed = _cache_key_for_race_playback(self._request(window_start_ms=1_800_000, window_end_ms=1_810_000))
 
         self.assertEqual(whole, windowed)
 

@@ -187,6 +187,11 @@ class LiveSessionStatus(BaseModel):
     last_error: str | None = None
     raw_bytes: int = 0
     snapshot_available: bool = False
+    messages: int = 0
+    # How the recorder is connected: with an F1TV token it is sent the cars, without one only the timing.
+    auth: dict | None = None
+    has_car_data: bool = False
+    has_positions: bool = False
 
 
 class TelemetryCompareRequest(BaseModel):

@@ -93,6 +93,9 @@ jobs:
       GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
       F1_INTERNAL_TOKEN: ${{ secrets.F1_INTERNAL_TOKEN }}
       F1_WORKERS: ${{ vars.F1_WORKERS || '2' }}
+      # Empty keeps the service's own default (the recorder's full snapshot on). `false` turns it off,
+      # which the live screen does not need and a long race's recording makes expensive.
+      F1_LIVE_SNAPSHOT: ${{ vars.F1_LIVE_SNAPSHOT || '' }}
       # One port per outbound proxy source (laptop, phone, a residential proxy, ...),
       # comma-separated - see `make tunnel` / deploy/f1-proxy-relay.sh.
       F1_PROXY_TUNNEL_PORTS: ${{ vars.F1_PROXY_TUNNEL_PORTS || '1080' }}
@@ -152,6 +155,7 @@ jobs:
           GHCR_TOKEN=$(printf '%q' "${GHCR_TOKEN}") \
           LAP_VISION_F1_INTERNAL_TOKEN=$(printf '%q' "${F1_INTERNAL_TOKEN}") \
           LAP_VISION_F1_WORKERS=$(printf '%q' "${F1_WORKERS}") \
+          LAP_VISION_F1_LIVE_SNAPSHOT=$(printf '%q' "${F1_LIVE_SNAPSHOT}") \
           PROXY_TUNNEL_PORTS=$(printf '%q' "${F1_PROXY_TUNNEL_PORTS}") \
           bash $(printf '%q' "${DEPLOY_PATH}/f1/deploy/deploy_f1.sh")
           EOF

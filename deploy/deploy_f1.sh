@@ -31,6 +31,9 @@ log() {
 FASTF1_CACHE_CONTAINER_DIR="/var/lib/lap-vision-f1/fastf1-cache"
 DATA_CACHE_CONTAINER_DIR="/var/lib/lap-vision-f1/data-cache"
 LIVE_DATA_CONTAINER_DIR="/var/lib/lap-vision-f1/live-timing"
+# The F1TV login (f1auth.json) the live recorder reads. A directory, not a file: a file replaced on
+# the host (scp writes a new one) would stay the old inode inside the container.
+SECRETS_CONTAINER_DIR="/run/f1-secrets"
 
 required_vars=(
   APP_ROOT
@@ -51,6 +54,7 @@ mkdir -p \
   "${APP_ROOT}/shared/f1-cache/fastf1" \
   "${APP_ROOT}/shared/f1-cache/data" \
   "${APP_ROOT}/shared/f1-cache/live-timing" \
+  "${APP_ROOT}/shared/f1-secrets" \
   "${APP_ROOT}/f1"
 
 docker network inspect "${NETWORK_NAME}" >/dev/null 2>&1 || docker network create "${NETWORK_NAME}" >/dev/null
@@ -154,6 +158,12 @@ fi
 container_name="${APP_NAME}-${next_color}"
 log "start candidate container ${container_name}"
 docker rm -f "${container_name}" >/dev/null 2>&1 || true
+
+# Set only when given: the default of the service is kept otherwise.
+extra_env=()
+if [[ -n "${LAP_VISION_F1_LIVE_SNAPSHOT:-}" ]]; then
+  extra_env+=(-e "LAP_VISION_F1_LIVE_SNAPSHOT=${LAP_VISION_F1_LIVE_SNAPSHOT}")
+fi
 docker run -d \
   --name "${container_name}" \
   --restart unless-stopped \
@@ -165,9 +175,12 @@ docker run -d \
   -e LAP_VISION_F1_FASTF1_CACHE_DIR="${FASTF1_CACHE_CONTAINER_DIR}" \
   -e LAP_VISION_F1_DATA_CACHE_DIR="${DATA_CACHE_CONTAINER_DIR}" \
   -e LAP_VISION_F1_LIVE_DATA_DIR="${LIVE_DATA_CONTAINER_DIR}" \
+  -e LAP_VISION_F1_F1TV_TOKEN_FILE="${SECRETS_CONTAINER_DIR}/f1auth.json" \
   -v "${APP_ROOT}/shared/f1-cache/fastf1:${FASTF1_CACHE_CONTAINER_DIR}" \
   -v "${APP_ROOT}/shared/f1-cache/data:${DATA_CACHE_CONTAINER_DIR}" \
   -v "${APP_ROOT}/shared/f1-cache/live-timing:${LIVE_DATA_CONTAINER_DIR}" \
+  -v "${APP_ROOT}/shared/f1-secrets:${SECRETS_CONTAINER_DIR}:ro" \
+  ${extra_env[@]+"${extra_env[@]}"} \
   "${IMAGE}" >/dev/null
 
 for _ in $(seq 1 40); do

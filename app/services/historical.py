@@ -68,9 +68,7 @@ def _import_fastf1(cache_dir: str):
     return fastf1
 
 
-def _prewarm_session_cache(
-    session: Any, *, laps: bool, telemetry: bool, weather: bool, messages: bool
-) -> None:
+def _prewarm_session_cache(session: Any, *, laps: bool, telemetry: bool, weather: bool, messages: bool) -> None:
     """Fire the independent per-category F1 API fetches concurrently so the sequential
     `session.load()` call right after this hits an already-warm cache for each of them.
 
@@ -679,15 +677,17 @@ def _attach_telemetry_to_position_samples(
             if abs(int(candidate["time_ms"]) - time_ms) < abs(int(nearest["time_ms"]) - time_ms):
                 nearest = candidate
 
-        enriched.append({
-            **sample,
-            "speed": nearest.get("speed"),
-            "throttle": nearest.get("throttle"),
-            "brake": nearest.get("brake"),
-            "rpm": nearest.get("rpm"),
-            "drs": nearest.get("drs"),
-            "gear": nearest.get("gear"),
-        })
+        enriched.append(
+            {
+                **sample,
+                "speed": nearest.get("speed"),
+                "throttle": nearest.get("throttle"),
+                "brake": nearest.get("brake"),
+                "rpm": nearest.get("rpm"),
+                "drs": nearest.get("drs"),
+                "gear": nearest.get("gear"),
+            }
+        )
 
     return enriched
 
@@ -855,12 +855,16 @@ def fetch_race_playback_payload(
     )
     if not position_streams:
         return response
-    car_streams = _session_car_streams(
-        session,
-        sample_step_ms=sample_step_ms,
-        window_start_ms=raw_window_start_ms,
-        window_end_ms=raw_window_end_ms,
-    ) if request.include_telemetry else {}
+    car_streams = (
+        _session_car_streams(
+            session,
+            sample_step_ms=sample_step_ms,
+            window_start_ms=raw_window_start_ms,
+            window_end_ms=raw_window_end_ms,
+        )
+        if request.include_telemetry
+        else {}
+    )
 
     result_rows: dict[str, dict[str, Any]] = {}
     driver_number_to_code: dict[str, str] = {}
@@ -890,9 +894,7 @@ def fetch_race_playback_payload(
         normalized_code = driver_number_to_code.get(str(driver_key), str(driver_key).strip().upper())
         if request.include_telemetry:
             telemetry_samples = (
-                car_streams.get(normalized_code)
-                or car_streams.get(str(driver_key).strip().upper())
-                or []
+                car_streams.get(normalized_code) or car_streams.get(str(driver_key).strip().upper()) or []
             )
             if telemetry_samples:
                 samples = _attach_telemetry_to_position_samples(samples, telemetry_samples)
@@ -925,14 +927,14 @@ def fetch_race_playback_payload(
             normalized_samples.append(normalized_sample)
         if request.window_start_ms is not None or request.window_end_ms is not None:
             normalized_samples = [
-                sample for sample in normalized_samples
+                sample
+                for sample in normalized_samples
                 if (
                     request.window_start_ms is None
                     or sample["time_ms"] >= max(0, request.window_start_ms - sample_step_ms)
                 )
                 and (
-                    request.window_end_ms is None
-                    or sample["time_ms"] <= max(0, request.window_end_ms + sample_step_ms)
+                    request.window_end_ms is None or sample["time_ms"] <= max(0, request.window_end_ms + sample_step_ms)
                 )
             ]
         driver["samples"] = normalized_samples
@@ -1425,9 +1427,7 @@ class HistoricalService:
         if payload.get("available") is not False:
             self.cache.write_json(cache_key, payload)
 
-        sliced = _slice_playback_window(
-            payload, request.window_start_ms, request.window_end_ms, sample_step_ms
-        )
+        sliced = _slice_playback_window(payload, request.window_start_ms, request.window_end_ms, sample_step_ms)
         sliced["cache_hit"] = False
         sliced["cache_key"] = cache_key
         return RacePlaybackResponse.model_validate(sliced)
