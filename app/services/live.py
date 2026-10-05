@@ -53,6 +53,13 @@ def token_status(token_file: Path | None) -> dict[str, Any]:
     }
 
 
+def valid_token(token_file: Path | None) -> str:
+    """The token when there is one and it has not expired, otherwise an empty string."""
+    if token_file is None or token_status(token_file)["mode"] != "f1tv":
+        return ""
+    return read_token(token_file)
+
+
 def _run_recorder_process(raw_file: str, proxy_url: str | None, token_file: str | None = None) -> None:
     """Entry point for the dedicated recorder process (kept top-level: multiprocessing on
     macOS/Windows uses 'spawn', which needs a picklable, importable target).
@@ -66,9 +73,12 @@ def _run_recorder_process(raw_file: str, proxy_url: str | None, token_file: str 
 
     SignalRClient = livetiming_client.SignalRClient  # noqa: N806
 
-    # Never FastF1's interactive login: see read_token.
+    # Never FastF1's interactive login: see read_token. Without a token that is still good the
+    # recorder takes FastF1's anonymous path (no_auth), the timing without the cars, instead of
+    # presenting an empty or expired token.
     path = Path(token_file) if token_file else None
-    livetiming_client.get_auth_token = lambda: read_token(path)
+    token = valid_token(path)
+    livetiming_client.get_auth_token = lambda: token
 
     if proxy_url:
         _apply_proxy_env(proxy_url)
@@ -81,7 +91,7 @@ def _run_recorder_process(raw_file: str, proxy_url: str | None, token_file: str 
             socks.set_default_proxy(socks.SOCKS5, parsed.hostname, parsed.port, rdns=True)
             socket.socket = socks.socksocket  # process-local: this is a dedicated child process
 
-    client = SignalRClient(filename=raw_file, filemode="a", timeout=0)
+    client = SignalRClient(filename=raw_file, filemode="a", timeout=0, no_auth=not token)
     client.start()
 
 
@@ -93,6 +103,9 @@ def _to_iso(epoch_seconds: float | None) -> str | None:
     if epoch_seconds is None:
         return None
     return datetime.fromtimestamp(epoch_seconds, tz=UTC).isoformat()
+
+
+RESTART_BACKOFF_SECONDS = 5.0
 
 
 @dataclass
@@ -108,6 +121,9 @@ class _LiveSession:
     started_at: float = field(default_factory=time.time)
     last_update: float | None = None
     last_error: str | None = None
+    token: str = ""  # what the recorder connected with: "" is the anonymous feed
+    restarts: int = 0
+    last_spawn: float = field(default_factory=time.time)
 
     @property
     def alive(self) -> bool:
@@ -162,19 +178,51 @@ class LiveSessionService:
             self._live_data_dir.mkdir(parents=True, exist_ok=True)
             raw_file = self._live_data_dir / f"{key.replace(':', '_')}.txt"
 
-            proxy_urls = self._historical.get_proxy_urls()
-            proxy_url = random.choice(proxy_urls) if proxy_urls else None
-
-            token_file = str(self._token_file) if self._token_file else None
-            process = Process(target=_run_recorder_process, args=(str(raw_file), proxy_url, token_file), daemon=True)
-            process.start()
-
-            live_session = _LiveSession(request=request, raw_file=raw_file, process=process)
+            live_session = _LiveSession(request=request, raw_file=raw_file, process=None)
+            self._spawn(live_session)
             self._sessions[key] = live_session
             live_session.tail_task = asyncio.create_task(self._tail_loop(key))
             if self._snapshot_enabled:
                 live_session.refresh_task = asyncio.create_task(self._refresh_loop(key))
             return self._status(live_session)
+
+    def _spawn(self, live_session: _LiveSession) -> None:
+        """Start the recorder process, on a proxy and a token chosen now."""
+        proxy_urls = self._historical.get_proxy_urls()
+        proxy_url = random.choice(proxy_urls) if proxy_urls else None
+        token_file = str(self._token_file) if self._token_file else None
+        live_session.token = valid_token(self._token_file)
+        process = Process(
+            target=_run_recorder_process, args=(str(live_session.raw_file), proxy_url, token_file), daemon=True
+        )
+        process.start()
+        live_session.process = process
+        live_session.last_spawn = time.time()
+
+    def _supervise(self, live_session: _LiveSession) -> None:
+        """Bring the recorder back when it has gone, or when a better token has been put in the file.
+
+        A recorder that dropped its socket is dead and records nothing more; one that connected
+        without a token (or with one that has since been replaced) keeps the feed it started with. Both
+        are cured by a new process, which appends to the same recording. Not more often than the
+        backoff, so a feed that refuses to connect does not become a loop of processes."""
+        process = live_session.process
+        if process is None or time.time() - live_session.last_spawn < RESTART_BACKOFF_SECONDS:
+            return
+        died = not process.is_alive()
+        renewed = process.is_alive() and (token := valid_token(self._token_file)) != "" and token != live_session.token
+        if not (died or renewed):
+            return
+        if renewed:
+            process.terminate()
+            process.join(timeout=5)
+        try:
+            self._spawn(live_session)
+        except Exception as exc:  # noqa: BLE001 - try again after the backoff
+            live_session.last_error = f"recorder restart failed: {exc}"
+            live_session.last_spawn = time.time()
+            return
+        live_session.restarts += 1
 
     async def replay(self, request: LiveSessionRequest, source: Path, speed: float = 1.0) -> LiveSessionStatus:
         """Play a recording back as if it were arriving now. For trying the live screen outside a
@@ -223,10 +271,12 @@ class LiveSessionService:
         return self._sessions.get(self._key(request))
 
     def state(self, request: LiveSessionRequest) -> dict[str, Any] | None:
-        """What the screen draws, or None when nothing is being recorded for the session."""
+        """What the screen draws, or None when nothing is being recorded or nothing has arrived yet."""
         live_session = self._live(request)
         if live_session is None:
             return None
+        if live_session.state.messages == 0:
+            return None  # nothing has arrived yet: the screen keeps waiting
         payload = live_session.state.snapshot()
         payload["running"] = live_session.alive
         payload["auth"] = token_status(self._token_file)
@@ -325,6 +375,7 @@ class LiveSessionService:
                         self._sync_outline(live_session)
             except OSError as exc:
                 live_session.last_error = str(exc)
+            self._supervise(live_session)
             await asyncio.sleep(0.5)
 
     @staticmethod

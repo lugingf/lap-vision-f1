@@ -1,13 +1,16 @@
 import asyncio
+import base64
 import json
 import math
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from app.domain.models import LiveSessionRequest
-from app.services.live import LiveSessionService, _LiveSession
+from app.services.live import LiveSessionService, _LiveSession, _run_recorder_process, valid_token
 
 REQUEST = LiveSessionRequest(year=2026, event="16", session="Race")
 
@@ -127,6 +130,160 @@ class TailTests(unittest.TestCase):
 
             asyncio.run(run())
             self.assertEqual(session.state.messages, 1)
+
+
+def _jwt(expires_in: float) -> str:
+    claims = base64.urlsafe_b64encode(json.dumps({"exp": time.time() + expires_in}).encode()).decode().rstrip("=")
+    return f"header.{claims}.signature"
+
+
+class StateWaitingTests(unittest.TestCase):
+    def test_no_state_until_the_first_message_arrives(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            service = _service(directory)
+            live = _session(directory, recorded=True)
+            service._sessions[service._key(REQUEST)] = live
+
+            self.assertIsNone(service.state(REQUEST))
+
+            _circuit(live)
+            payload = service.state(REQUEST)
+            self.assertIsNotNone(payload)
+            self.assertTrue(payload["running"])  # type: ignore[index]
+
+
+class RecorderAuthTests(unittest.TestCase):
+    def _run(self, token_file: Path | None) -> tuple[dict, str]:
+        import fastf1.livetiming.client as livetiming_client
+
+        captured: dict = {}
+
+        class FakeClient:
+            def __init__(self, **kwargs: object) -> None:
+                captured.update(kwargs)
+
+            def start(self) -> None:
+                captured["token"] = livetiming_client.get_auth_token()
+
+        with (
+            mock.patch.object(livetiming_client, "SignalRClient", FakeClient),
+            mock.patch.object(livetiming_client, "get_auth_token", livetiming_client.get_auth_token),
+        ):
+            _run_recorder_process("raw.txt", None, str(token_file) if token_file else None)
+        return captured, captured["token"]
+
+    def test_valid_token_decides_by_presence_and_expiry(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "token"
+            self.assertEqual(valid_token(path), "")  # missing file
+            self.assertEqual(valid_token(None), "")
+            path.write_text(_jwt(-60))
+            self.assertEqual(valid_token(path), "")  # expired
+            good = _jwt(3600)
+            path.write_text(good)
+            self.assertEqual(valid_token(path), good)
+
+    def test_recorder_is_anonymous_without_a_token(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            kwargs, token = self._run(Path(raw) / "missing")
+        self.assertTrue(kwargs["no_auth"])
+        self.assertEqual(token, "")
+
+    def test_recorder_is_anonymous_with_an_expired_token(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "token"
+            path.write_text(_jwt(-60))
+            kwargs, token = self._run(path)
+        self.assertTrue(kwargs["no_auth"])
+        self.assertEqual(token, "")
+
+    def test_recorder_authenticates_with_a_valid_token(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "token"
+            good = _jwt(3600)
+            path.write_text(good)
+            kwargs, token = self._run(path)
+        self.assertFalse(kwargs["no_auth"])
+        self.assertEqual(token, good)
+
+
+class _FakeProcess:
+    def __init__(self, alive: bool = True) -> None:
+        self.alive = alive
+        self.terminated = False
+
+    def is_alive(self) -> bool:
+        return self.alive
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.alive = False
+
+    def join(self, timeout: float | None = None) -> None:
+        pass
+
+
+class WatchdogTests(unittest.TestCase):
+    def _setup(self, directory: Path, token_file: Path | None = None) -> tuple[LiveSessionService, _LiveSession, list]:
+        service = LiveSessionService(SimpleNamespace(get_proxy_urls=lambda: []), directory, 5, token_file, False)
+        live = _LiveSession(request=REQUEST, raw_file=directory / "raw.txt", process=_FakeProcess())  # type: ignore[arg-type]
+        live.last_spawn = time.time() - 60
+        spawned: list[_FakeProcess] = []
+
+        def spawn(session: _LiveSession) -> None:
+            session.process = _FakeProcess()  # type: ignore[assignment]
+            session.token = valid_token(token_file)
+            session.last_spawn = time.time()
+            spawned.append(session.process)  # type: ignore[arg-type]
+
+        service._spawn = spawn  # type: ignore[method-assign]
+        return service, live, spawned
+
+    def test_a_dead_recorder_is_started_again(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            service, live, spawned = self._setup(Path(raw))
+            live.process.alive = False  # type: ignore[union-attr]
+            service._supervise(live)
+            self.assertEqual(len(spawned), 1)
+            self.assertEqual(live.restarts, 1)
+
+    def test_a_live_recorder_is_left_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            service, live, spawned = self._setup(Path(raw))
+            service._supervise(live)
+            self.assertEqual(spawned, [])
+
+    def test_restarts_wait_for_the_backoff(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            service, live, spawned = self._setup(Path(raw))
+            live.process.alive = False  # type: ignore[union-attr]
+            live.last_spawn = time.time()
+            service._supervise(live)
+            self.assertEqual(spawned, [])
+
+    def test_a_replay_is_not_supervised(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            service, live, spawned = self._setup(Path(raw))
+            live.process = None
+            service._supervise(live)
+            self.assertEqual(spawned, [])
+
+    def test_a_renewed_token_replaces_the_running_recorder(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "token"
+            service, live, spawned = self._setup(Path(raw), path)
+            old = live.process
+            live.token = ""  # connected anonymously
+            path.write_text(_jwt(3600))
+            service._supervise(live)
+            self.assertTrue(old.terminated)  # type: ignore[union-attr]
+            self.assertEqual(len(spawned), 1)
+            self.assertEqual(live.token, path.read_text())
+            # the same token again changes nothing
+            live.last_spawn = time.time() - 60
+            service._supervise(live)
+            self.assertEqual(len(spawned), 1)
 
 
 if __name__ == "__main__":
