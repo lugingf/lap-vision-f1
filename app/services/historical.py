@@ -220,7 +220,7 @@ def _cache_key_for_race_playback(request: RacePlaybackRequest) -> str:
     session_slug = request.session.strip().lower()
     return (
         f"playback/{request.year}/{event_slug}/{session_slug}/"
-        f"race-playback-v8-{max(100, request.sample_step_ms)}ms.json"
+        f"race-playback-v9-{max(100, request.sample_step_ms)}ms.json"
     )
 
 
@@ -479,8 +479,10 @@ def _pick_reference_track_polyline(session: Any, laps_frame: Any) -> tuple[list[
     if laps_frame is not None and hasattr(laps_frame, "sort_values") and hasattr(laps_frame, "iterlaps"):
         try:
             ordered = laps_frame.sort_values("LapTime")
-            for _, lap in ordered.iterlaps(require=["LapTime"]):
-                if bool(lap.get("Deleted")):
+            # iterlaps(require=...) hands pandas a set as an indexer, which pandas 2 refuses: the
+            # whole loop failed and every outline fell back to a stretch of one car's stream.
+            for _, lap in ordered.iterlaps():
+                if _timedelta_to_ms(lap.get("LapTime")) is None or bool(lap.get("Deleted")):
                     continue
                 try:
                     lap_frame = lap.get_pos_data()

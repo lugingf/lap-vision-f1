@@ -6,6 +6,7 @@ import pandas as pd  # type: ignore
 
 from app.domain.models import SessionRequest
 from app.services.historical import (
+    _pick_reference_track_polyline,
     _schedule_session_start,
     _session_bundle_has_data,
     _session_to_bundle_payload,
@@ -290,3 +291,33 @@ class CachedSessionPitFlagsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(written), 1, "the reloaded session replaces the stale cache entry")
         self.assertTrue(bundle.laps[0].is_pit_in_lap)
         self.assertFalse(bundle.laps[0].is_pit_out_lap)
+
+
+class ReferenceTrackPolylineTests(unittest.TestCase):
+    def test_outline_is_the_quickest_clean_lap(self):
+        from fastf1.core import Lap, Laps  # type: ignore
+
+        laps = Laps(
+            pd.DataFrame(
+                {
+                    "Driver": ["AAA", "BBB", "CCC"],
+                    "LapNumber": [1, 2, 3],
+                    "LapTime": [pd.NaT, pd.Timedelta(seconds=88), pd.Timedelta(seconds=90)],
+                    "Deleted": [False, True, False],
+                }
+            )
+        )
+
+        def pos_data(lap):
+            offset = {"AAA": 0.0, "BBB": 1000.0, "CCC": 2000.0}[lap["Driver"]]
+            return pd.DataFrame(
+                {"X": [offset + i for i in range(50)], "Y": [float(i) for i in range(50)], "Status": ["OnTrack"] * 50}
+            )
+
+        session = mock.Mock(spec=[])
+        with mock.patch.object(Lap, "get_pos_data", pos_data):
+            points, source = _pick_reference_track_polyline(session, laps)
+
+        self.assertEqual(source, "reference_lap")
+        self.assertEqual(len(points), 50)
+        self.assertEqual(points[0], {"x": 2000.0, "y": 0.0})
