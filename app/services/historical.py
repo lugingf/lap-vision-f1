@@ -303,6 +303,33 @@ def _to_float(value: Any) -> float | None:
         return None
 
 
+def _session_cache_has_pit_times(payload: dict[str, Any]) -> bool:
+    """Whether a cached session bundle was written since laps carry their pit times.
+
+    One written before has neither the times nor flags that mean anything: every lap says both
+    in and out. Its flags cannot be put right from what it holds, so it is loaded again.
+    """
+    laps = payload.get("laps") or []
+    for lap in laps:
+        if not isinstance(lap, dict) or "pit_in_time_ms" not in lap or "pit_out_time_ms" not in lap:
+            return False
+    return True
+
+
+def _pit_flags_from_times(payload: dict[str, Any]) -> dict[str, Any]:
+    """Set each lap's pit flags from its pit times.
+
+    Session bundles cached before the flags followed the times carry is_pit_in_lap and
+    is_pit_out_lap on every lap; their pit times are right. Serving them through this keeps a
+    real, timestamped stop and drops the rest, without loading the session again.
+    """
+    for lap in payload.get("laps") or []:
+        if isinstance(lap, dict):
+            lap["is_pit_in_lap"] = lap.get("pit_in_time_ms") is not None
+            lap["is_pit_out_lap"] = lap.get("pit_out_time_ms") is not None
+    return payload
+
+
 def _timedelta_to_ms(value: Any) -> int | None:
     if value is None:
         return None
@@ -1149,6 +1176,10 @@ def _session_to_bundle_payload(session: Any, request: SessionRequest) -> dict[st
             if lap_number is None:
                 continue
 
+            # FastF1 leaves a lap without a pit visit as NaT, which is not None: the flags have to
+            # follow the converted times, or every lap reads as both an in-lap and an out-lap.
+            pit_in_time_ms = _timedelta_to_ms(row.get("PitInTime"))
+            pit_out_time_ms = _timedelta_to_ms(row.get("PitOutTime"))
             laps.append(
                 {
                     "driver_code": driver_code,
@@ -1162,13 +1193,13 @@ def _session_to_bundle_payload(session: Any, request: SessionRequest) -> dict[st
                     "sector_3_ms": _timedelta_to_ms(row.get("Sector3Time")),
                     "compound": compound,
                     "tyre_life": _to_int(row.get("TyreLife")),
-                    "is_pit_out_lap": bool(row.get("PitOutTime") is not None),
-                    "is_pit_in_lap": bool(row.get("PitInTime") is not None),
+                    "is_pit_out_lap": pit_out_time_ms is not None,
+                    "is_pit_in_lap": pit_in_time_ms is not None,
                     "deleted": bool(row.get("Deleted") or False),
                     "position": _to_int(row.get("Position")),
                     "speed_trap_kmh": _to_float(row.get("SpeedST")),
-                    "pit_in_time_ms": _timedelta_to_ms(row.get("PitInTime")),
-                    "pit_out_time_ms": _timedelta_to_ms(row.get("PitOutTime")),
+                    "pit_in_time_ms": pit_in_time_ms,
+                    "pit_out_time_ms": pit_out_time_ms,
                 }
             )
 
@@ -1357,7 +1388,8 @@ class HistoricalService:
             # this check, from exactly the kind of silently-swallowed failure it now guards
             # against. Treating it as a miss lets the next request retry for real instead of
             # replaying the same empty answer forever.
-            if cached is not None and _session_bundle_has_data(cached):
+            if cached is not None and _session_bundle_has_data(cached) and _session_cache_has_pit_times(cached):
+                _pit_flags_from_times(cached)
                 cached["cache_hit"] = True
                 cached["cache_key"] = cache_key
                 return SessionBundle.model_validate(cached)

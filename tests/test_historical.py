@@ -4,9 +4,11 @@ from unittest import mock
 
 import pandas as pd  # type: ignore
 
+from app.domain.models import SessionRequest
 from app.services.historical import (
     _schedule_session_start,
     _session_bundle_has_data,
+    _session_to_bundle_payload,
     _utc_iso,
     fetch_schedule_payload,
 )
@@ -165,3 +167,126 @@ class ScheduleResponseKeepsSessionTimesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LapPitFlagsTests(unittest.TestCase):
+    """FastF1 marks a lap without a pit visit with NaT, and NaT is not None: the flags used to read
+    True on every lap of every session, so nothing downstream could tell a pit lap from any other."""
+
+    def _laps(self) -> list[dict]:
+        frame = pd.DataFrame(
+            {
+                "Driver": ["ANT", "ANT", "ANT", "ANT"],
+                "LapNumber": [21, 22, 23, 24],
+                "Stint": [1, 1, 2, 2],
+                "LapTime": [timedelta(seconds=90)] * 4,
+                "PitInTime": [pd.NaT, timedelta(seconds=2010), pd.NaT, pd.NaT],
+                "PitOutTime": [pd.NaT, pd.NaT, timedelta(seconds=2032), pd.NaT],
+            }
+        )
+        session = mock.Mock(spec=["laps"])
+        session.laps = frame
+        request = SessionRequest(year=2026, event=3, session="R", include_weather=False, include_messages=False)
+        return _session_to_bundle_payload(session, request)["laps"]
+
+    def test_only_the_in_lap_and_the_out_lap_are_flagged(self) -> None:
+        laps = self._laps()
+        self.assertEqual([lap["is_pit_in_lap"] for lap in laps], [False, True, False, False])
+        self.assertEqual([lap["is_pit_out_lap"] for lap in laps], [False, False, True, False])
+
+    def test_the_flags_come_with_the_times(self) -> None:
+        laps = self._laps()
+        self.assertEqual(laps[1]["pit_in_time_ms"], 2010000)
+        self.assertEqual(laps[2]["pit_out_time_ms"], 2032000)
+        self.assertIsNone(laps[0]["pit_in_time_ms"])
+        self.assertIsNone(laps[0]["pit_out_time_ms"])
+
+
+class CachedSessionPitFlagsTests(unittest.IsolatedAsyncioTestCase):
+    """A session bundle cached before the fix carries both flags on every lap; its pit times are
+    right. Served from the cache, it must come out with the flags its times give."""
+
+    async def test_a_cached_bundle_is_served_with_flags_from_its_pit_times(self) -> None:
+        from pathlib import Path
+
+        from app.services.historical import HistoricalService
+
+        lap = {"driver_code": "ANT", "lap_time_ms": 90000, "is_pit_in_lap": True, "is_pit_out_lap": True,
+               "pit_in_time_ms": None, "pit_out_time_ms": None, "deleted": False}
+        cached = {
+            "descriptor": {
+                "season_year": 2026, "event_name": "Japanese Grand Prix",
+                "session_name": "Race", "session_type": "Race",
+            },
+            "telemetry_available": False,
+            "position_data_available": False,
+            "drivers": [{"driver_code": "ANT"}],
+            "results": [],
+            "laps": [
+                {**lap, "lap_number": 21},
+                {**lap, "lap_number": 22, "pit_in_time_ms": 5935866},
+                {**lap, "lap_number": 23, "pit_out_time_ms": 5959138},
+            ],
+            "stints": [],
+            "weather": [],
+            "race_control": [],
+        }
+
+        class _Cache:
+            def read_json(self, _key: str):
+                return dict(cached, laps=[dict(item) for item in cached["laps"]])
+
+            def write_json(self, _key: str, _payload) -> None:
+                raise AssertionError("a cache hit must not be written again")
+
+        with mock.patch("app.services.historical.ProcessPoolExecutor"):
+            service = HistoricalService(Path("/tmp/fastf1"), _Cache(), worker_processes=1)
+        no_compute = AssertionError("a cache hit must not be computed")
+        with mock.patch.object(service, "_compute_once", side_effect=no_compute):
+            bundle = await service.load_session(SessionRequest(year=2026, event=3, session="R"))
+
+        self.assertTrue(bundle.cache_hit)
+        self.assertEqual([lap.is_pit_in_lap for lap in bundle.laps], [False, True, False])
+        self.assertEqual([lap.is_pit_out_lap for lap in bundle.laps], [False, False, True])
+        self.assertEqual(bundle.laps[1].pit_in_time_ms, 5935866)
+
+    async def test_a_bundle_cached_before_laps_carried_pit_times_is_loaded_again(self) -> None:
+        from pathlib import Path
+
+        from app.services.historical import HistoricalService
+
+        stale_lap = {"driver_code": "ANT", "lap_number": 22, "lap_time_ms": 90000,
+                     "is_pit_in_lap": True, "is_pit_out_lap": True, "deleted": False}
+        base = {
+            "descriptor": {"season_year": 2026, "event_name": "Japanese Grand Prix", "session_name": "Race",
+                           "session_type": "Race"},
+            "telemetry_available": False,
+            "position_data_available": False,
+            "drivers": [{"driver_code": "ANT"}],
+            "results": [],
+            "stints": [],
+            "weather": [],
+            "race_control": [],
+        }
+        fresh_lap = {**stale_lap, "is_pit_out_lap": False, "pit_in_time_ms": 5935866, "pit_out_time_ms": None}
+        written: list[dict] = []
+
+        class _Cache:
+            def read_json(self, _key: str):
+                return {**base, "laps": [dict(stale_lap)]}
+
+            def write_json(self, _key: str, payload) -> None:
+                written.append(payload)
+
+        async def compute(*_args):
+            return {**base, "laps": [dict(fresh_lap)]}
+
+        with mock.patch("app.services.historical.ProcessPoolExecutor"):
+            service = HistoricalService(Path("/tmp/fastf1"), _Cache(), worker_processes=1)
+        with mock.patch.object(service, "_compute_once", side_effect=compute):
+            bundle = await service.load_session(SessionRequest(year=2026, event=3, session="R"))
+
+        self.assertFalse(bundle.cache_hit)
+        self.assertEqual(len(written), 1, "the reloaded session replaces the stale cache entry")
+        self.assertTrue(bundle.laps[0].is_pit_in_lap)
+        self.assertFalse(bundle.laps[0].is_pit_out_lap)
