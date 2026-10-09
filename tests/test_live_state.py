@@ -243,6 +243,51 @@ class RobustnessTests(unittest.TestCase):
         self.assertEqual([lap["lap"] for lap in laps], [4, 5])
         self.assertEqual(laps[1]["time"], "1:29.500")
 
+    def test_a_qualifying_lap_keeps_its_time_behind_the_fastest(self) -> None:
+        state = LiveState()
+        state.feed(
+            "TimingData",
+            {
+                "Lines": {
+                    "1": {"NumberOfLaps": 3, "Position": "1", "TimeDiffToFastest": "", "TimeDifftoPositionAhead": ""},
+                    "3": {"NumberOfLaps": 4, "Position": "2", "TimeDiffToFastest": "+0.123", "TimeDifftoPositionAhead": "+0.123"},
+                    "12": {"NumberOfLaps": 5, "Position": "3", "TimeDiffToFastest": "+0.168", "TimeDifftoPositionAhead": "+0.045"},
+                }
+            },
+        )
+        laps = {driver["number"]: driver["laps"] for driver in state.history()["drivers"]}
+        self.assertEqual((laps["1"][0]["position"], laps["1"][0]["gap_to_leader"]), (1, None))
+        self.assertEqual((laps["3"][0]["gap_to_leader"], laps["3"][0]["interval"]), ("+0.123", "+0.123"))
+        self.assertEqual((laps["12"][0]["gap_to_leader"], laps["12"][0]["interval"]), ("+0.168", "+0.045"))
+
+    def test_a_practice_lap_keeps_its_time_behind_the_fastest_as_a_value_node(self) -> None:
+        state = LiveState()
+        state.feed(
+            "TimingData",
+            {"Lines": {"44": {"NumberOfLaps": 7, "Position": "4", "TimeDiffToFastest": {"Value": "+0.912"}, "TimeDifftoPositionAhead": {"Value": "+0.210"}}}},
+        )
+        lap = state.history()["drivers"][0]["laps"][0]
+        self.assertEqual((lap["gap_to_leader"], lap["interval"]), ("+0.912", "+0.210"))
+
+    def test_a_race_lap_keeps_the_gaps_on_the_road(self) -> None:
+        state = LiveState()
+        state.feed(
+            "TimingData",
+            {
+                "Lines": {
+                    "3": {
+                        "NumberOfLaps": 12,
+                        "Position": "2",
+                        "GapToLeader": "+2.717",
+                        "IntervalToPositionAhead": {"Value": "+2.717", "Catching": True},
+                        "TimeDiffToFastest": "+0.400",
+                    }
+                }
+            },
+        )
+        lap = state.history()["drivers"][0]["laps"][0]
+        self.assertEqual((lap["gap_to_leader"], lap["interval"]), ("+2.717", "+2.717"))
+
 
 def _car_message(stamp: str, speed: int) -> dict:
     return {"Entries": [{"Utc": stamp, "Cars": {"3": {"Channels": {"2": speed}}}}]}

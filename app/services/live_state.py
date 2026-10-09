@@ -354,8 +354,10 @@ class LiveState:
                 "lap": laps,
                 "time": _value(last),
                 "position": _int(timing.get("Position")),
-                "gap_to_leader": _value(timing.get("GapToLeader")),
-                "interval": _value(timing.get("IntervalToPositionAhead")),
+                # As on the tower: a practice or a qualifying gives the best lap's time behind the
+                # fastest and behind the one above instead of the race's gaps on the road.
+                "gap_to_leader": _value(timing.get("GapToLeader")) or _value(timing.get("TimeDiffToFastest")),
+                "interval": _value(timing.get("IntervalToPositionAhead")) or _value(timing.get("TimeDifftoPositionAhead")),
                 "compound": compound,
                 "in_pit": bool(timing.get("InPit")),
             }
