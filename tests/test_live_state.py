@@ -250,8 +250,18 @@ class RobustnessTests(unittest.TestCase):
             {
                 "Lines": {
                     "1": {"NumberOfLaps": 3, "Position": "1", "TimeDiffToFastest": "", "TimeDifftoPositionAhead": ""},
-                    "3": {"NumberOfLaps": 4, "Position": "2", "TimeDiffToFastest": "+0.123", "TimeDifftoPositionAhead": "+0.123"},
-                    "12": {"NumberOfLaps": 5, "Position": "3", "TimeDiffToFastest": "+0.168", "TimeDifftoPositionAhead": "+0.045"},
+                    "3": {
+                        "NumberOfLaps": 4,
+                        "Position": "2",
+                        "TimeDiffToFastest": "+0.123",
+                        "TimeDifftoPositionAhead": "+0.123",
+                    },
+                    "12": {
+                        "NumberOfLaps": 5,
+                        "Position": "3",
+                        "TimeDiffToFastest": "+0.168",
+                        "TimeDifftoPositionAhead": "+0.045",
+                    },
                 }
             },
         )
@@ -264,7 +274,16 @@ class RobustnessTests(unittest.TestCase):
         state = LiveState()
         state.feed(
             "TimingData",
-            {"Lines": {"44": {"NumberOfLaps": 7, "Position": "4", "TimeDiffToFastest": {"Value": "+0.912"}, "TimeDifftoPositionAhead": {"Value": "+0.210"}}}},
+            {
+                "Lines": {
+                    "44": {
+                        "NumberOfLaps": 7,
+                        "Position": "4",
+                        "TimeDiffToFastest": {"Value": "+0.912"},
+                        "TimeDifftoPositionAhead": {"Value": "+0.210"},
+                    }
+                }
+            },
         )
         lap = state.history()["drivers"][0]["laps"][0]
         self.assertEqual((lap["gap_to_leader"], lap["interval"]), ("+0.912", "+0.210"))
