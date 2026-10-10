@@ -1124,7 +1124,7 @@ def fetch_session_payload(
     return _session_to_bundle_payload(session, request)
 
 
-def _lap_driver_code(row: Any) -> str:
+def _lap_driver_code(row: Any, codes_by_number: dict[str, str]) -> str:
     """Whose lap it is, named as the results name the driver: the abbreviation, or the number when
     the session does not know the abbreviation. Empty when the lap names nobody."""
     for key in ("Driver", "DriverNumber"):
@@ -1132,9 +1132,17 @@ def _lap_driver_code(row: Any) -> str:
         if value is None or (isinstance(value, float) and math.isnan(value)):
             continue
         text = str(value).strip()
-        if text and text.lower() != "nan":
-            return text
+        if not text or text.lower() == "nan":
+            continue
+        if key == "DriverNumber":
+            return codes_by_number.get(_driver_number_key(value), text)
+        return text
     return ""
+
+
+def _driver_number_key(value: Any) -> str:
+    number = _to_int(value)
+    return str(number) if number is not None else str(value).strip()
 
 
 def _session_to_bundle_payload(session: Any, request: SessionRequest) -> dict[str, Any]:
@@ -1154,6 +1162,7 @@ def _session_to_bundle_payload(session: Any, request: SessionRequest) -> dict[st
 
     drivers: list[dict[str, Any]] = []
     results: list[dict[str, Any]] = []
+    codes_by_number: dict[str, str] = {}
 
     results_frame = _safe_session_attr(session, "results")
     if results_frame is not None and hasattr(results_frame, "iterrows"):
@@ -1168,6 +1177,8 @@ def _session_to_bundle_payload(session: Any, request: SessionRequest) -> dict[st
             }
             if not any(item["driver_code"] == driver_item["driver_code"] for item in drivers):
                 drivers.append(driver_item)
+            if driver_code and driver_item["permanent_number"] is not None:
+                codes_by_number[str(driver_item["permanent_number"])] = str(driver_code)
 
             results.append(
                 {
@@ -1190,7 +1201,7 @@ def _session_to_bundle_payload(session: Any, request: SessionRequest) -> dict[st
         stint_index: dict[tuple[str, int], dict[str, Any]] = {}
 
         for _, row in laps_frame.iterrows():
-            driver_code = _lap_driver_code(row)
+            driver_code = _lap_driver_code(row, codes_by_number)
             stint_no = _to_int(row.get("Stint"))
             compound = row.get("Compound")
             lap_number = _to_int(row.get("LapNumber"))

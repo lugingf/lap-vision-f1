@@ -347,6 +347,31 @@ class LapDriverCodeTests(unittest.TestCase):
         self.assertEqual([lap["driver_code"] for lap in payload["laps"]], ["VER", "3", "63"])
         self.assertEqual([stint["driver_code"] for stint in payload["stints"]], ["3", "63", "VER"])
 
+    def test_a_lap_without_an_abbreviation_belongs_to_the_driver_the_results_name_by_that_number(self) -> None:
+        results = pd.DataFrame(
+            {"Abbreviation": ["VER", "HAD"], "DriverNumber": ["3", "6"], "Position": [1.0, 2.0]}
+        )
+        laps = pd.DataFrame(
+            {
+                "Driver": ["", float("nan"), "HAD", ""],
+                "DriverNumber": ["3", 3.0, "6", "63"],
+                "LapNumber": [1, 2, 1, 1],
+                "Stint": [1, 1, 1, 1],
+                "LapTime": [timedelta(seconds=90)] * 4,
+                "PitInTime": [pd.NaT] * 4,
+                "PitOutTime": [pd.NaT] * 4,
+            }
+        )
+        session = mock.Mock(spec=["laps", "results"])
+        session.laps = laps
+        session.results = results
+        request = SessionRequest(year=2026, event=17, session="Sprint", include_weather=False, include_messages=False)
+        payload = _session_to_bundle_payload(session, request)
+
+        self.assertEqual([driver["driver_code"] for driver in payload["drivers"]], ["VER", "HAD"])
+        self.assertEqual([lap["driver_code"] for lap in payload["laps"]], ["VER", "VER", "HAD", "63"])
+        self.assertEqual([stint["driver_code"] for stint in payload["stints"]], ["63", "HAD", "VER"])
+
 
 class LiveSnapshotCacheTests(unittest.TestCase):
     """A live snapshot parses a recording that keeps growing. Through FastF1's parsed-data cache it
