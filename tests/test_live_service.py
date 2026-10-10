@@ -2,12 +2,19 @@ import asyncio
 import base64
 import json
 import math
+import os
+import socket
+import ssl
 import tempfile
+import threading
 import time
 import unittest
+import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+
+import requests
 
 from app.domain.models import LiveSessionRequest
 from app.services.live import LiveSessionService, _LiveSession, _run_recorder_process, valid_token
@@ -206,6 +213,89 @@ class RecorderAuthTests(unittest.TestCase):
             kwargs, token = self._run(path)
         self.assertFalse(kwargs["no_auth"])
         self.assertEqual(token, good)
+
+
+class _FakeSocks5(threading.Thread):
+    """A SOCKS5 proxy that records where it is asked to connect and answers as the far end itself."""
+
+    def __init__(self) -> None:
+        super().__init__(daemon=True)
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server.bind(("127.0.0.1", 0))
+        self.server.listen()
+        self.port = self.server.getsockname()[1]
+        self.targets: list[tuple[str, int]] = []
+
+    def run(self) -> None:
+        while True:
+            try:
+                connection, _ = self.server.accept()
+            except OSError:
+                return
+            with connection:
+                self._serve(connection)
+
+    def _serve(self, connection: socket.socket) -> None:
+        _, methods = connection.recv(2)
+        connection.recv(methods)
+        connection.sendall(b"\x05\x00")
+        _, _, _, kind = connection.recv(4)
+        if kind == 3:
+            host = connection.recv(connection.recv(1)[0]).decode()
+        else:
+            host = socket.inet_ntoa(connection.recv(4))
+        port = int.from_bytes(connection.recv(2), "big")
+        self.targets.append((host, port))
+        if (host, port) == ("127.0.0.1", self.port):
+            connection.sendall(b"\x05\x06\x00\x01" + bytes(6))  # TTL expired: the proxy asked to reach itself
+            return
+        connection.sendall(b"\x05\x00\x00\x01" + bytes(6))
+        request = b""
+        while b"\r\n\r\n" not in request:
+            chunk = connection.recv(4096)
+            if not chunk:
+                return
+            request += chunk
+        connection.sendall(
+            b"HTTP/1.1 200 OK\r\nSet-Cookie: AWSALBCORS=x\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+        )
+
+
+class RecorderProxyTests(unittest.TestCase):
+    def test_negotiation_goes_through_the_socks_proxy_once(self) -> None:
+        import fastf1.livetiming.client as livetiming_client
+        import socks
+
+        proxy = _FakeSocks5()
+        proxy.start()
+        self.addCleanup(proxy.server.close)
+        proxy_url = f"socks5h://127.0.0.1:{proxy.port}"
+        target = "http://127.0.0.1:8443/signalr/negotiate"
+        answers: list[str] = []
+
+        class FakeClient:
+            def __init__(self, **kwargs: object) -> None:
+                pass
+
+            def start(self) -> None:
+                # FastF1's pre-negotiation, then the SignalR negotiation the way signalrcore opens it.
+                answers.append(requests.options(target, timeout=5).text)
+                request = urllib.request.Request(target)
+                with urllib.request.urlopen(request, context=ssl.create_default_context(), timeout=5) as response:
+                    answers.append(response.read().decode())
+
+        inherited = {name: proxy_url for name in ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy")}
+        with (
+            mock.patch.dict(os.environ, inherited),
+            mock.patch.object(socket, "socket", socket.socket),
+            mock.patch.object(socks.socksocket, "default_proxy", None),
+            mock.patch.object(livetiming_client, "SignalRClient", FakeClient),
+            mock.patch.object(livetiming_client, "get_auth_token", livetiming_client.get_auth_token),
+        ):
+            _run_recorder_process("raw.txt", proxy_url, None)
+
+        self.assertEqual(answers, ["ok", "ok"])
+        self.assertEqual(proxy.targets, [("127.0.0.1", 8443), ("127.0.0.1", 8443)])
 
 
 class _FakeProcess:

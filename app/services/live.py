@@ -4,6 +4,7 @@ import ast
 import asyncio
 import base64
 import json
+import os
 import random
 import re
 import time
@@ -81,15 +82,20 @@ def _run_recorder_process(raw_file: str, proxy_url: str | None, token_file: str 
     livetiming_client.get_auth_token = lambda: token
 
     if proxy_url:
-        _apply_proxy_env(proxy_url)
         parsed = urlparse(proxy_url)
         if parsed.scheme.startswith("socks") and parsed.hostname and parsed.port:
             import socket
 
             import socks  # type: ignore
 
+            # Every socket already goes through the proxy, so a proxy in the environment would make
+            # requests and urllib connect to the proxy through itself.
+            for name in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy"):
+                os.environ.pop(name, None)
             socks.set_default_proxy(socks.SOCKS5, parsed.hostname, parsed.port, rdns=True)
             socket.socket = socks.socksocket  # process-local: this is a dedicated child process
+        else:
+            _apply_proxy_env(proxy_url)
 
     client = SignalRClient(filename=raw_file, filemode="a", timeout=0, no_auth=not token)
     client.start()
