@@ -321,3 +321,106 @@ class ReferenceTrackPolylineTests(unittest.TestCase):
         self.assertEqual(source, "reference_lap")
         self.assertEqual(len(points), 50)
         self.assertEqual(points[0], {"x": 2000.0, "y": 0.0})
+
+
+class LapDriverCodeTests(unittest.TestCase):
+    """A session FastF1 knows only partly - as a live recording does early on - has laps without a
+    driver abbreviation. They used to go out with an empty code, which the backend could not store."""
+
+    def test_a_lap_without_an_abbreviation_is_named_by_number_and_a_lap_of_nobody_is_left_out(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "Driver": ["VER", "", None, ""],
+                "DriverNumber": ["1", "3", "63", None],
+                "LapNumber": [1, 1, 1, 1],
+                "Stint": [1, 1, 1, 1],
+                "LapTime": [timedelta(seconds=90)] * 4,
+                "PitInTime": [pd.NaT] * 4,
+                "PitOutTime": [pd.NaT] * 4,
+            }
+        )
+        session = mock.Mock(spec=["laps"])
+        session.laps = frame
+        request = SessionRequest(year=2026, event=17, session="Sprint", include_weather=False, include_messages=False)
+        payload = _session_to_bundle_payload(session, request)
+
+        self.assertEqual([lap["driver_code"] for lap in payload["laps"]], ["VER", "3", "63"])
+        self.assertEqual([stint["driver_code"] for stint in payload["stints"]], ["3", "63", "VER"])
+
+
+class LiveSnapshotCacheTests(unittest.TestCase):
+    """A live snapshot parses a recording that keeps growing. Through FastF1's parsed-data cache it
+    replayed the first parse for ever and left that partial session for the archive's own load."""
+
+    def test_each_snapshot_reads_the_recording_afresh_and_leaves_nothing_in_the_cache(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        import fastf1
+        from fastf1.req import Cache
+
+        from app.services import historical
+
+        recording = {"drivers": 2}
+
+        @Cache.api_request_wrapper
+        def driver_info(api_path: str, livedata: object = None) -> dict:
+            return {"drivers": recording["drivers"]}
+
+        class Session:
+            def load(self, **kwargs: object) -> None:
+                path = "/static/2026/2026-10-11_Test/2026-10-10_Sprint/"
+                self.parsed = driver_info(path, livedata=kwargs["livedata"])
+
+        with tempfile.TemporaryDirectory() as cache_dir, tempfile.NamedTemporaryFile(suffix=".txt") as raw:
+            request = {"year": 2026, "event": 17, "session": "Sprint"}
+            with (
+                mock.patch.object(fastf1, "get_session", lambda *args: Session()),
+                mock.patch("fastf1.livetiming.data.LiveTimingData", lambda path: path),
+                mock.patch.object(historical, "_session_to_bundle_payload", lambda session, request: session.parsed),
+            ):
+                first = historical.fetch_live_snapshot_payload(raw.name, cache_dir, request)
+                recording["drivers"] = 22
+                second = historical.fetch_live_snapshot_payload(raw.name, cache_dir, request)
+                parsed = [path for path in Path(cache_dir).rglob("*") if path.suffix == ".ff1pkl"]
+
+            # The cache works as before outside the snapshot.
+            self.assertFalse(Cache._tmp_disabled)
+
+        self.assertEqual(first, {"drivers": 2})
+        self.assertEqual(second, {"drivers": 22})
+        self.assertEqual(parsed, [])
+
+
+class CachedSessionLapDriverTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_cached_bundle_with_a_lap_of_nobody_is_loaded_again(self) -> None:
+        from pathlib import Path
+
+        from app.services.historical import HistoricalService
+
+        lap = {"lap_number": 1, "lap_time_ms": 90000, "pit_in_time_ms": None, "pit_out_time_ms": None, "deleted": False}
+        cached = {
+            "descriptor": {
+                "season_year": 2026, "event_name": "Test Grand Prix",
+                "session_name": "Sprint", "session_type": "Sprint",
+            },
+            "telemetry_available": False,
+            "position_data_available": False,
+            "drivers": [{"driver_code": "3"}],
+            "results": [{"driver_code": "3"}],
+            "laps": [{**lap, "driver_code": "3"}, {**lap, "driver_code": ""}],
+            "stints": [],
+            "weather": [],
+            "race_control": [],
+        }
+        fresh = {**cached, "laps": [{**lap, "driver_code": "3"}]}
+        cache = mock.Mock()
+        cache.read_json.return_value = cached
+        with mock.patch("app.services.historical.ProcessPoolExecutor"):
+            service = HistoricalService(Path("/tmp/fastf1"), cache, worker_processes=1)
+        with mock.patch.object(service, "_compute_once", mock.AsyncMock(return_value=dict(fresh))) as compute:
+            bundle = await service.load_session(SessionRequest(year=2026, event=17, session="Sprint"))
+
+        compute.assert_awaited_once()
+        self.assertFalse(bundle.cache_hit)
+        self.assertEqual([lap.driver_code for lap in bundle.laps], ["3"])

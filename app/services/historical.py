@@ -316,6 +316,12 @@ def _session_cache_has_pit_times(payload: dict[str, Any]) -> bool:
     return True
 
 
+def _session_cache_names_lap_drivers(payload: dict[str, Any]) -> bool:
+    """Whether every lap of a cached session bundle says whose it is. One with a lap that does not
+    was built from a partial session, which a live snapshot used to leave in the parsed cache."""
+    return all(isinstance(lap, dict) and str(lap.get("driver_code") or "").strip() for lap in payload.get("laps") or [])
+
+
 def _pit_flags_from_times(payload: dict[str, Any]) -> dict[str, Any]:
     """Set each lap's pit flags from its pit times.
 
@@ -1118,6 +1124,19 @@ def fetch_session_payload(
     return _session_to_bundle_payload(session, request)
 
 
+def _lap_driver_code(row: Any) -> str:
+    """Whose lap it is, named as the results name the driver: the abbreviation, or the number when
+    the session does not know the abbreviation. Empty when the lap names nobody."""
+    for key in ("Driver", "DriverNumber"):
+        value = row.get(key)
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            continue
+        text = str(value).strip()
+        if text and text.lower() != "nan":
+            return text
+    return ""
+
+
 def _session_to_bundle_payload(session: Any, request: SessionRequest) -> dict[str, Any]:
     event = getattr(session, "event", None)
     descriptor = {
@@ -1171,11 +1190,11 @@ def _session_to_bundle_payload(session: Any, request: SessionRequest) -> dict[st
         stint_index: dict[tuple[str, int], dict[str, Any]] = {}
 
         for _, row in laps_frame.iterrows():
-            driver_code = str(row.get("Driver", ""))
+            driver_code = _lap_driver_code(row)
             stint_no = _to_int(row.get("Stint"))
             compound = row.get("Compound")
             lap_number = _to_int(row.get("LapNumber"))
-            if lap_number is None:
+            if lap_number is None or not driver_code:
                 continue
 
             # FastF1 leaves a lap without a pit visit as NaT, which is not None: the flags have to
@@ -1297,13 +1316,17 @@ def fetch_live_snapshot_payload(raw_file: str, cache_dir: str, request_payload: 
     request = SessionRequest.model_validate(request_payload)
     livedata = LiveTimingData(raw_file)
     session = fastf1.get_session(request.year, request.event, request.session)
-    session.load(
-        laps=True,
-        telemetry=request.include_telemetry,
-        weather=True,
-        messages=True,
-        livedata=livedata,
-    )
+    # FastF1 keeps what it parses in the same files whether it came from the archive or from a
+    # recording, and reads them back first: through the cache a snapshot would replay the first one
+    # instead of the recording as it grows, and leave that partial session for the archive's load.
+    with fastf1.Cache.disabled():
+        session.load(
+            laps=True,
+            telemetry=request.include_telemetry,
+            weather=True,
+            messages=True,
+            livedata=livedata,
+        )
     return _session_to_bundle_payload(session, request)
 
 
@@ -1390,7 +1413,12 @@ class HistoricalService:
             # this check, from exactly the kind of silently-swallowed failure it now guards
             # against. Treating it as a miss lets the next request retry for real instead of
             # replaying the same empty answer forever.
-            if cached is not None and _session_bundle_has_data(cached) and _session_cache_has_pit_times(cached):
+            if (
+                cached is not None
+                and _session_bundle_has_data(cached)
+                and _session_cache_has_pit_times(cached)
+                and _session_cache_names_lap_drivers(cached)
+            ):
                 _pit_flags_from_times(cached)
                 cached["cache_hit"] = True
                 cached["cache_key"] = cache_key
