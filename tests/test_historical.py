@@ -442,7 +442,8 @@ class LiveSnapshotCacheTests(unittest.TestCase):
                 mock.patch.object(historical, "_session_to_bundle_payload", lambda session, request: {}),
                 mock.patch.object(requests.Session, "send", side_effect=AssertionError("went to the network")),
             ):
-                historical.fetch_live_snapshot_payload(raw.name, cache_dir, {"year": 2026, "event": 17, "session": "Race"})
+                request = {"year": 2026, "event": 17, "session": "Race"}
+                historical.fetch_live_snapshot_payload(raw.name, cache_dir, request)
 
         self.assertEqual(asked, ["refused"])
         self.assertIs(Cache._requests_session, online)
