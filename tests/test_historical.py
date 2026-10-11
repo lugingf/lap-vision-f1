@@ -416,6 +416,37 @@ class LiveSnapshotCacheTests(unittest.TestCase):
         self.assertEqual(second, {"drivers": 22})
         self.assertEqual(parsed, [])
 
+    def test_a_snapshot_asks_nothing_of_the_network(self) -> None:
+        import tempfile
+
+        import fastf1
+        import requests
+        from fastf1.req import Cache
+
+        from app.services import historical
+
+        online = Cache._requests_session
+        asked: list[str] = []
+
+        class Session:
+            def load(self, **kwargs: object) -> None:
+                try:
+                    Cache.requests_get("https://api.jolpi.ca/ergast/f1/2026/17/results.json")
+                except requests.ConnectionError:
+                    asked.append("refused")
+
+        with tempfile.TemporaryDirectory() as cache_dir, tempfile.NamedTemporaryFile(suffix=".txt") as raw:
+            with (
+                mock.patch.object(fastf1, "get_session", lambda *args: Session()),
+                mock.patch("fastf1.livetiming.data.LiveTimingData", lambda path: path),
+                mock.patch.object(historical, "_session_to_bundle_payload", lambda session, request: {}),
+                mock.patch.object(requests.Session, "send", side_effect=AssertionError("went to the network")),
+            ):
+                historical.fetch_live_snapshot_payload(raw.name, cache_dir, {"year": 2026, "event": 17, "session": "Race"})
+
+        self.assertEqual(asked, ["refused"])
+        self.assertIs(Cache._requests_session, online)
+
 
 class CachedSessionLapDriverTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_cached_bundle_with_a_lap_of_nobody_is_loaded_again(self) -> None:

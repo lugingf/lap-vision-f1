@@ -7,11 +7,14 @@ import random
 import re
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, TypeVar
+
+import requests
 
 from app.cache import CacheManager
 from app.domain.models import (
@@ -1330,7 +1333,10 @@ def fetch_live_snapshot_payload(raw_file: str, cache_dir: str, request_payload: 
     # FastF1 keeps what it parses in the same files whether it came from the archive or from a
     # recording, and reads them back first: through the cache a snapshot would replay the first one
     # instead of the recording as it grows, and leave that partial session for the archive's load.
-    with fastf1.Cache.disabled():
+    # Without the cache FastF1 would also ask Ergast for results on every snapshot, which it has none
+    # of during a session; a snapshot every few seconds spent the hourly request limit the worker
+    # processes share with the archive's loads.
+    with fastf1.Cache.disabled(), _no_network(fastf1):
         session.load(
             laps=True,
             telemetry=request.include_telemetry,
@@ -1339,6 +1345,21 @@ def fetch_live_snapshot_payload(raw_file: str, cache_dir: str, request_payload: 
             livedata=livedata,
         )
     return _session_to_bundle_payload(session, request)
+
+
+class _OfflineSession(requests.Session):
+    def send(self, request: Any, **kwargs: Any) -> Any:
+        raise requests.ConnectionError(f"live snapshot does not fetch {request.url}")
+
+
+@contextmanager
+def _no_network(fastf1: Any) -> Iterator[None]:
+    online = fastf1.req.Cache._requests_session
+    fastf1.req.Cache._requests_session = _OfflineSession()
+    try:
+        yield
+    finally:
+        fastf1.req.Cache._requests_session = online
 
 
 _PROXY_SETTINGS_KEY = "runtime/proxy.json"
