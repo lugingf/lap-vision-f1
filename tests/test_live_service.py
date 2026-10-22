@@ -17,7 +17,8 @@ from unittest import mock
 import requests
 
 from app.domain.models import LiveSessionRequest
-from app.services.live import LiveSessionService, _LiveSession, _run_recorder_process, valid_token
+from app.services.f1tv import F1TVAuth, F1TVTokens
+from app.services.live import LiveSessionService, _LiveSession, _run_recorder_process
 
 REQUEST = LiveSessionRequest(year=2026, event="16", session="Race")
 
@@ -160,8 +161,22 @@ class StateWaitingTests(unittest.TestCase):
             self.assertTrue(payload["running"])  # type: ignore[index]
 
 
+def _store(path: Path, token: str) -> None:
+    path.write_text(json.dumps({"version": 1, "value": token, "expires_at": time.time() + 3600}))
+
+
 class RecorderAuthTests(unittest.TestCase):
-    def _run(self, token_file: Path | None) -> tuple[dict, str]:
+    def setUp(self) -> None:
+        from fastf1.internals.f1account import token_manager
+
+        saved = (token_manager._store, token_manager._authenticate, token_manager._token)
+
+        def restore() -> None:
+            token_manager._store, token_manager._authenticate, token_manager._token = saved
+
+        self.addCleanup(restore)
+
+    def _run(self, tokens: F1TVTokens | None) -> tuple[dict, str]:
         import fastf1.livetiming.client as livetiming_client
 
         captured: dict = {}
@@ -171,46 +186,43 @@ class RecorderAuthTests(unittest.TestCase):
                 captured.update(kwargs)
 
             def start(self) -> None:
-                captured["token"] = livetiming_client.get_auth_token()
+                # what FastF1's client presents when it connects with a token
+                captured["token"] = "" if captured["no_auth"] else livetiming_client.get_token().value
 
-        with (
-            mock.patch.object(livetiming_client, "SignalRClient", FakeClient),
-            mock.patch.object(livetiming_client, "get_auth_token", livetiming_client.get_auth_token),
-        ):
-            _run_recorder_process("raw.txt", None, str(token_file) if token_file else None)
+        with mock.patch.object(livetiming_client, "SignalRClient", FakeClient):
+            _run_recorder_process("raw.txt", None, tokens)
         return captured, captured["token"]
-
-    def test_valid_token_decides_by_presence_and_expiry(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            path = Path(raw) / "token"
-            self.assertEqual(valid_token(path), "")  # missing file
-            self.assertEqual(valid_token(None), "")
-            path.write_text(_jwt(-60))
-            self.assertEqual(valid_token(path), "")  # expired
-            good = _jwt(3600)
-            path.write_text(good)
-            self.assertEqual(valid_token(path), good)
 
     def test_recorder_is_anonymous_without_a_token(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            kwargs, token = self._run(Path(raw) / "missing")
-        self.assertTrue(kwargs["no_auth"])
-        self.assertEqual(token, "")
+            for tokens in (None, F1TVTokens(Path(raw) / "missing")):
+                kwargs, token = self._run(tokens)
+                self.assertTrue(kwargs["no_auth"])
+                self.assertEqual(token, "")
 
     def test_recorder_is_anonymous_with_an_expired_token(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            path = Path(raw) / "token"
-            path.write_text(_jwt(-60))
-            kwargs, token = self._run(path)
+            path = Path(raw) / "store.json"
+            _store(path, _jwt(-60))
+            kwargs, token = self._run(F1TVTokens(path))
         self.assertTrue(kwargs["no_auth"])
         self.assertEqual(token, "")
 
-    def test_recorder_authenticates_with_a_valid_token(self) -> None:
+    def test_recorder_authenticates_with_the_kept_token(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            path = Path(raw) / "token"
+            path = Path(raw) / "store.json"
             good = _jwt(3600)
-            path.write_text(good)
-            kwargs, token = self._run(path)
+            _store(path, good)
+            kwargs, token = self._run(F1TVTokens(path))
+        self.assertFalse(kwargs["no_auth"])
+        self.assertEqual(token, good)
+
+    def test_recorder_authenticates_with_a_token_put_by_hand(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            by_hand = Path(raw) / "f1auth.json"
+            good = _jwt(3600)
+            by_hand.write_text(good)
+            kwargs, token = self._run(F1TVTokens(Path(raw) / "store.json", by_hand))
         self.assertFalse(kwargs["no_auth"])
         self.assertEqual(token, good)
 
@@ -290,7 +302,6 @@ class RecorderProxyTests(unittest.TestCase):
             mock.patch.object(socket, "socket", socket.socket),
             mock.patch.object(socks.socksocket, "default_proxy", None),
             mock.patch.object(livetiming_client, "SignalRClient", FakeClient),
-            mock.patch.object(livetiming_client, "get_auth_token", livetiming_client.get_auth_token),
         ):
             _run_recorder_process("raw.txt", proxy_url, None)
 
@@ -315,15 +326,15 @@ class _FakeProcess:
 
 
 class WatchdogTests(unittest.TestCase):
-    def _setup(self, directory: Path, token_file: Path | None = None) -> tuple[LiveSessionService, _LiveSession, list]:
-        service = LiveSessionService(SimpleNamespace(get_proxy_urls=lambda: []), directory, 5, token_file, False)
+    def _setup(self, directory: Path, auth: F1TVAuth | None = None) -> tuple[LiveSessionService, _LiveSession, list]:
+        service = LiveSessionService(SimpleNamespace(get_proxy_urls=lambda: []), directory, 5, auth, False)
         live = _LiveSession(request=REQUEST, raw_file=directory / "raw.txt", process=_FakeProcess())  # type: ignore[arg-type]
         live.last_spawn = time.time() - 60
         spawned: list[_FakeProcess] = []
 
         def spawn(session: _LiveSession) -> None:
             session.process = _FakeProcess()  # type: ignore[assignment]
-            session.token = valid_token(token_file)
+            session.token = auth.tokens.token() if auth is not None else ""
             session.last_spawn = time.time()
             spawned.append(session.process)  # type: ignore[arg-type]
 
@@ -361,19 +372,50 @@ class WatchdogTests(unittest.TestCase):
 
     def test_a_renewed_token_replaces_the_running_recorder(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            path = Path(raw) / "token"
-            service, live, spawned = self._setup(Path(raw), path)
+            path = Path(raw) / "store.json"
+            service, live, spawned = self._setup(Path(raw), F1TVAuth(F1TVTokens(path)))
             old = live.process
             live.token = ""  # connected anonymously
-            path.write_text(_jwt(3600))
+            fresh = _jwt(3600)
+            _store(path, fresh)  # the service has signed in
             service._supervise(live)
             self.assertTrue(old.terminated)  # type: ignore[union-attr]
             self.assertEqual(len(spawned), 1)
-            self.assertEqual(live.token, path.read_text())
+            self.assertEqual(live.token, fresh)
             # the same token again changes nothing
             live.last_spawn = time.time() - 60
             service._supervise(live)
             self.assertEqual(len(spawned), 1)
+
+    def test_a_renewal_leaves_a_recorder_with_a_token_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "store.json"
+            service, live, spawned = self._setup(Path(raw), F1TVAuth(F1TVTokens(path)))
+            live.token = _jwt(3600)  # connected with the old token
+            _store(path, _jwt(4 * 86400))  # the service has signed in again
+            service._supervise(live)
+            self.assertFalse(live.process.terminated)  # type: ignore[union-attr]
+            self.assertEqual(spawned, [])
+
+
+class WeekendSignInTests(unittest.TestCase):
+    def test_the_first_session_of_a_weekend_asks_for_a_sign_in(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            auth = mock.Mock(**{"status.return_value": {"mode": "f1tv"}})
+            service = LiveSessionService(SimpleNamespace(get_proxy_urls=lambda: []), Path(raw), 5, auth, False)
+            service._spawn = lambda session: setattr(session, "process", _FakeProcess())  # type: ignore[method-assign]
+
+            async def start(event: str, session: str) -> None:
+                await service.start(LiveSessionRequest(year=2026, event=event, session=session))
+                await service.stop(LiveSessionRequest(year=2026, event=event, session=session))
+
+            asyncio.run(start("Mexico City", "Practice 1"))
+            self.assertEqual(auth.request.call_count, 1)
+            asyncio.run(start("Mexico City", "Qualifying"))
+            asyncio.run(start("Mexico City", "Race"))
+            self.assertEqual(auth.request.call_count, 1)  # the weekend's token carries the rest
+            asyncio.run(start("Sao Paulo", "Practice 1"))
+            self.assertEqual(auth.request.call_count, 2)
 
 
 if __name__ == "__main__":

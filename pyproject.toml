@@ -8,7 +8,9 @@ dependencies = [
     "fastapi>=0.115.0,<0.136",
     "starlette<1.1",
     "uvicorn[standard]>=0.30.0",
-    "fastf1>=3.4.0",
+    # Pinned exactly: a pre-release, the first with the password sign-in and the archive's token, and
+    # app/services/f1tv.py reaches into its token manager.
+    "fastf1==3.9.0a0",
     "pandas>=2.2.0",
     "numpy>=1.26.0",
     "python-dotenv>=1.0.1",

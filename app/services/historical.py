@@ -1366,10 +1366,18 @@ _PROXY_SETTINGS_KEY = "runtime/proxy.json"
 
 
 class HistoricalService:
-    def __init__(self, fastf1_cache_dir: Path, cache: CacheManager, worker_processes: int) -> None:
+    def __init__(
+        self,
+        fastf1_cache_dir: Path,
+        cache: CacheManager,
+        worker_processes: int,
+        initializer: Callable[[], None] | None = None,
+    ) -> None:
         self.fastf1_cache_dir = fastf1_cache_dir
         self.cache = cache
-        self.executor = ProcessPoolExecutor(max_workers=worker_processes)
+        # The initializer prepares each worker before its first job: it is where the F1TV token is
+        # handed to FastF1 (F1TVAuth.install).
+        self.executor = ProcessPoolExecutor(max_workers=worker_processes, initializer=initializer)
         self._proxy_lock = threading.Lock()
         # What is being computed right now, by cache key.
         #

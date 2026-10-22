@@ -2,22 +2,32 @@ from __future__ import annotations
 
 from app.cache import CacheManager
 from app.config import Settings, load_settings
+from app.services.f1tv import F1TVAuth, F1TVTokens
 from app.services.historical import HistoricalService
 from app.services.live import LiveSessionService
 from app.services.prefetch import SessionPrefetchScheduler
 
 _settings = load_settings()
 _cache = CacheManager(_settings.data_cache_dir)
+_f1tv_tokens = F1TVTokens(store_file=_settings.f1tv_store_file, fallback_file=_settings.f1tv_token_file)
 _historical_service = HistoricalService(
     fastf1_cache_dir=_settings.fastf1_cache_dir,
     cache=_cache,
     worker_processes=_settings.worker_processes,
+    initializer=_f1tv_tokens.install,
+)
+_f1tv_auth = F1TVAuth(
+    _f1tv_tokens,
+    username=_settings.f1tv_username,
+    password=_settings.f1tv_password,
+    require_proxy=_settings.f1tv_require_proxy,
+    proxy_urls=_historical_service.get_proxy_urls,
 )
 _live_service = LiveSessionService(
     historical=_historical_service,
     live_data_dir=_settings.live_data_dir,
     quantum_seconds=_settings.live_quantum_seconds,
-    token_file=_settings.f1tv_token_file,
+    auth=_f1tv_auth,
     snapshot_enabled=_settings.live_snapshot_enabled,
 )
 _prefetch_scheduler = SessionPrefetchScheduler(
@@ -32,6 +42,10 @@ _prefetch_scheduler = SessionPrefetchScheduler(
 
 def get_settings() -> Settings:
     return _settings
+
+
+def get_f1tv_auth() -> F1TVAuth:
+    return _f1tv_auth
 
 
 def get_historical_service() -> HistoricalService:

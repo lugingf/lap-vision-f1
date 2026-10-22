@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from app.config import Settings
-from app.deps import get_historical_service, get_live_service, get_settings
+from app.deps import get_f1tv_auth, get_historical_service, get_live_service, get_settings
 from app.domain.models import (
     HealthResponse,
     LiveSessionRequest,
@@ -23,6 +23,7 @@ from app.domain.models import (
     TelemetryCompareRequest,
     TelemetryCompareResponse,
 )
+from app.services.f1tv import F1TVAuth
 from app.services.historical import HistoricalService
 from app.services.live import LiveSessionService
 
@@ -31,6 +32,7 @@ router = APIRouter()
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 HistoricalServiceDep = Annotated[HistoricalService, Depends(get_historical_service)]
 LiveServiceDep = Annotated[LiveSessionService, Depends(get_live_service)]
+F1TVAuthDep = Annotated[F1TVAuth, Depends(get_f1tv_auth)]
 
 
 def require_internal_token(
@@ -207,6 +209,12 @@ async def live_session_snapshot(
         return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content={"detail": "no snapshot available yet"})
     payload = {**payload, "cache_hit": False, "cache_key": "live"}
     return SessionBundle.model_validate(payload)
+
+
+@router.get("/v1/f1tv/status", dependencies=[Depends(require_internal_token)])
+async def f1tv_status(auth: F1TVAuthDep) -> JSONResponse:
+    """Whether the service holds an F1TV token, until when, and how its last sign-in went. Never the token."""
+    return JSONResponse(content=auth.status())
 
 
 def _live_request(year: int, event: str, session: str) -> LiveSessionRequest:

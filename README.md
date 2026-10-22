@@ -36,6 +36,9 @@ Optional env vars:
 - `LAP_VISION_F1_FASTF1_CACHE_DIR=./var/fastf1-cache`
 - `LAP_VISION_F1_DATA_CACHE_DIR=./var/data-cache`
 - `LAP_VISION_F1_INTERNAL_TOKEN=dev-token`
+- `F1_USERNAME`, `F1_PASSWORD` - F1TV account the service signs in with (see `deploy/F1TV_TOKEN.md`)
+- `LAP_VISION_F1_F1TV_STORE_FILE=./var/f1tv-token.json` - where the signed-in token is kept
+- `LAP_VISION_F1_F1TV_TOKEN_FILE` - a token put there by hand, used when signing in fails
 
 ## Run
 
@@ -96,6 +99,7 @@ Required GitHub secrets:
 - `DEPLOY_PATH`
 - `DEPLOY_SSH_KEY`
 - `F1_INTERNAL_TOKEN`
+- `F1_USERNAME`, `F1_PASSWORD` (optional) - F1TV account for live car data and the timing archive
 
 Optional GitHub variables:
 

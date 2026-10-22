@@ -31,9 +31,15 @@ log() {
 FASTF1_CACHE_CONTAINER_DIR="/var/lib/lap-vision-f1/fastf1-cache"
 DATA_CACHE_CONTAINER_DIR="/var/lib/lap-vision-f1/data-cache"
 LIVE_DATA_CONTAINER_DIR="/var/lib/lap-vision-f1/live-timing"
-# The F1TV login (f1auth.json) the live recorder reads. A directory, not a file: a file replaced on
-# the host (scp writes a new one) would stay the old inode inside the container.
+# A F1TV token put by hand (f1auth.json), the fallback when signing in fails. A directory, not a
+# file: a file replaced on the host (scp writes a new one) would stay the old inode inside the container.
 SECRETS_CONTAINER_DIR="/run/f1-secrets"
+# The token the service signs in for itself, kept where blue and green both find it, so a deploy
+# does not sign in again.
+F1TV_AUTH_CONTAINER_DIR="/var/lib/lap-vision-f1/f1tv"
+# The F1TV account the service signs in with (F1_USERNAME / F1_PASSWORD). Kept on the host in a file
+# only its owner reads and handed to the container as --env-file, not on a command line.
+F1TV_ENV_FILE="${APP_ROOT}/f1tv.env"
 
 required_vars=(
   APP_ROOT
@@ -55,6 +61,7 @@ mkdir -p \
   "${APP_ROOT}/shared/f1-cache/data" \
   "${APP_ROOT}/shared/f1-cache/live-timing" \
   "${APP_ROOT}/shared/f1-secrets" \
+  "${APP_ROOT}/shared/f1tv" \
   "${APP_ROOT}/f1"
 
 docker network inspect "${NETWORK_NAME}" >/dev/null 2>&1 || docker network create "${NETWORK_NAME}" >/dev/null
@@ -159,8 +166,21 @@ container_name="${APP_NAME}-${next_color}"
 log "start candidate container ${container_name}"
 docker rm -f "${container_name}" >/dev/null 2>&1 || true
 
+# Written only when both are given: without them in the deploy, a file put on the host by hand stays.
+if [[ -n "${F1_USERNAME:-}" && -n "${F1_PASSWORD:-}" ]]; then
+  f1tv_env_tmp="$(mktemp)"
+  printf 'F1_USERNAME=%s\nF1_PASSWORD=%s\n' "${F1_USERNAME}" "${F1_PASSWORD}" > "${f1tv_env_tmp}"
+  install -m 600 "${f1tv_env_tmp}" "${F1TV_ENV_FILE}"
+  rm -f "${f1tv_env_tmp}"
+fi
+
 # Set only when given: the default of the service is kept otherwise.
 extra_env=()
+if [[ -f "${F1TV_ENV_FILE}" ]]; then
+  extra_env+=(--env-file "${F1TV_ENV_FILE}")
+else
+  log "no ${F1TV_ENV_FILE}: the service will not sign in to F1TV (set the F1_USERNAME / F1_PASSWORD secrets)"
+fi
 if [[ -n "${LAP_VISION_F1_LIVE_SNAPSHOT:-}" ]]; then
   extra_env+=(-e "LAP_VISION_F1_LIVE_SNAPSHOT=${LAP_VISION_F1_LIVE_SNAPSHOT}")
 fi
@@ -176,10 +196,13 @@ docker run -d \
   -e LAP_VISION_F1_DATA_CACHE_DIR="${DATA_CACHE_CONTAINER_DIR}" \
   -e LAP_VISION_F1_LIVE_DATA_DIR="${LIVE_DATA_CONTAINER_DIR}" \
   -e LAP_VISION_F1_F1TV_TOKEN_FILE="${SECRETS_CONTAINER_DIR}/f1auth.json" \
+  -e LAP_VISION_F1_F1TV_STORE_FILE="${F1TV_AUTH_CONTAINER_DIR}/f1tv-token.json" \
+  -e LAP_VISION_F1_F1TV_REQUIRE_PROXY=true \
   -v "${APP_ROOT}/shared/f1-cache/fastf1:${FASTF1_CACHE_CONTAINER_DIR}" \
   -v "${APP_ROOT}/shared/f1-cache/data:${DATA_CACHE_CONTAINER_DIR}" \
   -v "${APP_ROOT}/shared/f1-cache/live-timing:${LIVE_DATA_CONTAINER_DIR}" \
   -v "${APP_ROOT}/shared/f1-secrets:${SECRETS_CONTAINER_DIR}:ro" \
+  -v "${APP_ROOT}/shared/f1tv:${F1TV_AUTH_CONTAINER_DIR}" \
   ${extra_env[@]+"${extra_env[@]}"} \
   "${IMAGE}" >/dev/null
 

@@ -410,7 +410,7 @@ class LiveSnapshotCacheTests(unittest.TestCase):
                 parsed = [path for path in Path(cache_dir).rglob("*") if path.suffix == ".ff1pkl"]
 
             # The cache works as before outside the snapshot.
-            self.assertFalse(Cache._tmp_disabled)
+            self.assertFalse(Cache._http_tmp_disabled or Cache._func_tmp_disabled)
 
         self.assertEqual(first, {"drivers": 2})
         self.assertEqual(second, {"drivers": 22})

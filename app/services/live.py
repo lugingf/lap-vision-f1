@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import base64
 import json
 import os
 import random
@@ -16,52 +15,12 @@ from typing import Any
 from urllib.parse import urlparse
 
 from app.domain.models import LiveSessionRequest, LiveSessionStatus
+from app.services.f1tv import F1TVAuth, F1TVTokens
 from app.services.historical import HistoricalService, _apply_proxy_env, fetch_live_snapshot_payload
 from app.services.live_state import LiveState
 
 
-def read_token(token_file: Path | None) -> str:
-    """The F1TV subscription token, or an empty string when there is none.
-
-    The feed answers without it, with the timing and without the cars: positions and car data are
-    sent only to a subscriber. FastF1's own way of getting one opens a login in a browser and waits
-    for it, which on a server is a recorder that hangs and records nothing; here the token is a file
-    somebody put there, and its absence is a way of connecting, not a wait.
-    """
-    if token_file is None:
-        return ""
-    try:
-        return token_file.read_text().strip()
-    except OSError:
-        return ""
-
-
-def token_status(token_file: Path | None) -> dict[str, Any]:
-    """What the token on disk is, read without verifying it: whether there is one and until when."""
-    token = read_token(token_file)
-    if not token:
-        return {"mode": "anonymous", "expires_at": None, "expired": False}
-    try:
-        claims = json.loads(base64.urlsafe_b64decode(token.split(".")[1] + "=="))
-    except (IndexError, ValueError):
-        return {"mode": "f1tv", "expires_at": None, "expired": False}
-    expires = claims.get("exp")
-    expired = bool(expires) and expires < time.time()
-    return {
-        "mode": "anonymous" if expired else "f1tv",
-        "expires_at": _to_iso(expires) if expires else None,
-        "expired": expired,
-    }
-
-
-def valid_token(token_file: Path | None) -> str:
-    """The token when there is one and it has not expired, otherwise an empty string."""
-    if token_file is None or token_status(token_file)["mode"] != "f1tv":
-        return ""
-    return read_token(token_file)
-
-
-def _run_recorder_process(raw_file: str, proxy_url: str | None, token_file: str | None = None) -> None:
+def _run_recorder_process(raw_file: str, proxy_url: str | None, tokens: F1TVTokens | None = None) -> None:
     """Entry point for the dedicated recorder process (kept top-level: multiprocessing on
     macOS/Windows uses 'spawn', which needs a picklable, importable target).
 
@@ -74,12 +33,13 @@ def _run_recorder_process(raw_file: str, proxy_url: str | None, token_file: str 
 
     SignalRClient = livetiming_client.SignalRClient  # noqa: N806
 
-    # Never FastF1's interactive login: see read_token. Without a token that is still good the
-    # recorder takes FastF1's anonymous path (no_auth), the timing without the cars, instead of
-    # presenting an empty or expired token.
-    path = Path(token_file) if token_file else None
-    token = valid_token(path)
-    livetiming_client.get_auth_token = lambda: token
+    # The token the service keeps, never a sign-in of the recorder's own (see app.services.f1tv).
+    # Without one that is still good the recorder takes FastF1's anonymous path (no_auth), the timing
+    # without the cars, instead of presenting an empty or expired token.
+    token = ""
+    if tokens is not None:
+        tokens.install()
+        token = tokens.token()
 
     if proxy_url:
         parsed = urlparse(proxy_url)
@@ -154,13 +114,15 @@ class LiveSessionService:
         historical: HistoricalService,
         live_data_dir: Path,
         quantum_seconds: int,
-        token_file: Path | None = None,
+        auth: F1TVAuth | None = None,
         snapshot_enabled: bool = True,
     ) -> None:
         self._historical = historical
         self._live_data_dir = live_data_dir
         self._quantum_seconds = quantum_seconds
-        self._token_file = token_file
+        self._auth = auth
+        # The weekends (year and event) a recording has been started for: the first one signs in.
+        self._weekends: set[str] = set()
         # The session bundle FastF1 builds from the whole recording, every few seconds. The live screen
         # reads the state kept message by message and does not need it; it stays for the session page's
         # recorder panel, and can be switched off to spare the processor a long race's recording.
@@ -181,6 +143,14 @@ class LiveSessionService:
             if existing is not None:
                 self._cleanup(existing)
 
+            # The weekend's first session signs in afresh: the token then lasts past the race, and
+            # nothing signs in while the cars are on track. The recorder does not wait for it: it
+            # connects with the token there is, and one that had none is restarted when it comes.
+            weekend = f"{request.year}:{_slugify(request.event)}"
+            if self._auth is not None and weekend not in self._weekends:
+                self._weekends.add(weekend)
+                self._auth.request()
+
             self._live_data_dir.mkdir(parents=True, exist_ok=True)
             raw_file = self._live_data_dir / f"{key.replace(':', '_')}.txt"
 
@@ -196,27 +166,35 @@ class LiveSessionService:
         """Start the recorder process, on a proxy and a token chosen now."""
         proxy_urls = self._historical.get_proxy_urls()
         proxy_url = random.choice(proxy_urls) if proxy_urls else None
-        token_file = str(self._token_file) if self._token_file else None
-        live_session.token = valid_token(self._token_file)
+        live_session.token = self._token()
+        tokens = self._auth.tokens if self._auth is not None else None
         process = Process(
-            target=_run_recorder_process, args=(str(live_session.raw_file), proxy_url, token_file), daemon=True
+            target=_run_recorder_process, args=(str(live_session.raw_file), proxy_url, tokens), daemon=True
         )
         process.start()
         live_session.process = process
         live_session.last_spawn = time.time()
 
+    def _token(self) -> str:
+        return self._auth.tokens.token() if self._auth is not None else ""
+
+    def _auth_status(self) -> dict[str, Any] | None:
+        return self._auth.status() if self._auth is not None else None
+
     def _supervise(self, live_session: _LiveSession) -> None:
-        """Bring the recorder back when it has gone, or when a better token has been put in the file.
+        """Bring the recorder back when it has gone, or when a token has come for one that has none.
 
         A recorder that dropped its socket is dead and records nothing more; one that connected
-        without a token (or with one that has since been replaced) keeps the feed it started with. Both
-        are cured by a new process, which appends to the same recording. Not more often than the
-        backoff, so a feed that refuses to connect does not become a loop of processes."""
+        without a token keeps the timing-only feed it started with. Both are cured by a new process,
+        which appends to the same recording. One that connected with a token is left alone when the
+        token is renewed: the connection outlives it, and a restart mid-session is a gap in the race.
+        Not more often than the backoff, so a feed that refuses to connect does not become a loop of
+        processes."""
         process = live_session.process
         if process is None or time.time() - live_session.last_spawn < RESTART_BACKOFF_SECONDS:
             return
         died = not process.is_alive()
-        renewed = process.is_alive() and (token := valid_token(self._token_file)) != "" and token != live_session.token
+        renewed = process.is_alive() and live_session.token == "" and self._token() != ""
         if not (died or renewed):
             return
         if renewed:
@@ -285,7 +263,7 @@ class LiveSessionService:
             return None  # nothing has arrived yet: the screen keeps waiting
         payload = live_session.state.snapshot()
         payload["running"] = live_session.alive
-        payload["auth"] = token_status(self._token_file)
+        payload["auth"] = self._auth_status()
         return payload
 
     def telemetry(
@@ -350,7 +328,7 @@ class LiveSessionService:
             raw_bytes=live_session.raw_file.stat().st_size if live_session.raw_file.exists() else 0,
             snapshot_available=live_session.snapshot is not None,
             messages=live_session.state.messages,
-            auth=token_status(self._token_file),
+            auth=self._auth_status(),
             has_car_data=bool(live_session.state.car),
             has_positions=bool(live_session.state.position),
         )

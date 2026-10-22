@@ -92,6 +92,10 @@ jobs:
       GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
       GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
       F1_INTERNAL_TOKEN: ${{ secrets.F1_INTERNAL_TOKEN }}
+      # The F1TV account the service signs in with to get the cars and the archive (deploy/F1TV_TOKEN.md).
+      # Optional: without them the service uses a token put on the server by hand, if any.
+      F1_USERNAME: ${{ secrets.F1_USERNAME }}
+      F1_PASSWORD: ${{ secrets.F1_PASSWORD }}
       F1_WORKERS: ${{ vars.F1_WORKERS || '2' }}
       # Empty keeps the service's own default (the recorder's full snapshot on). `false` turns it off,
       # which the live screen does not need and a long race's recording makes expensive.
@@ -154,6 +158,8 @@ jobs:
           GHCR_USERNAME=$(printf '%q' "${GHCR_USER}") \
           GHCR_TOKEN=$(printf '%q' "${GHCR_TOKEN}") \
           LAP_VISION_F1_INTERNAL_TOKEN=$(printf '%q' "${F1_INTERNAL_TOKEN}") \
+          F1_USERNAME=$(printf '%q' "${F1_USERNAME}") \
+          F1_PASSWORD=$(printf '%q' "${F1_PASSWORD}") \
           LAP_VISION_F1_WORKERS=$(printf '%q' "${F1_WORKERS}") \
           LAP_VISION_F1_LIVE_SNAPSHOT=$(printf '%q' "${F1_LIVE_SNAPSHOT}") \
           PROXY_TUNNEL_PORTS=$(printf '%q' "${F1_PROXY_TUNNEL_PORTS}") \
