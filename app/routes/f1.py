@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from app.config import Settings
-from app.deps import get_f1tv_auth, get_historical_service, get_live_service, get_settings
+from app.deps import get_f1tv_auth, get_historical_service, get_live_service, get_proxy_health, get_settings
 from app.domain.models import (
     HealthResponse,
     LiveSessionRequest,
@@ -26,6 +26,7 @@ from app.domain.models import (
 from app.services.f1tv import F1TVAuth
 from app.services.historical import HistoricalService
 from app.services.live import LiveSessionService
+from app.services.proxy_health import ProxyHealth
 
 router = APIRouter()
 
@@ -33,6 +34,7 @@ SettingsDep = Annotated[Settings, Depends(get_settings)]
 HistoricalServiceDep = Annotated[HistoricalService, Depends(get_historical_service)]
 LiveServiceDep = Annotated[LiveSessionService, Depends(get_live_service)]
 F1TVAuthDep = Annotated[F1TVAuth, Depends(get_f1tv_auth)]
+ProxyHealthDep = Annotated[ProxyHealth, Depends(get_proxy_health)]
 
 
 def require_internal_token(
@@ -153,6 +155,12 @@ async def set_proxy(
 ) -> ProxySettingsResponse:
     historical_service.set_proxy_urls(request.https_proxies)
     return ProxySettingsResponse(https_proxies=historical_service.get_proxy_urls())
+
+
+@router.get("/v1/admin/proxy/status", dependencies=[Depends(require_internal_token)])
+async def proxy_status(proxy_health: ProxyHealthDep) -> JSONResponse:
+    """Whether F1 is reachable through the registered proxies, as of the last check (every 2 minutes)."""
+    return JSONResponse(content=proxy_health.status())
 
 
 @router.post(

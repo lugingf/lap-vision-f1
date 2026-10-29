@@ -6,6 +6,7 @@ from app.services.f1tv import F1TVAuth, F1TVTokens
 from app.services.historical import HistoricalService
 from app.services.live import LiveSessionService
 from app.services.prefetch import SessionPrefetchScheduler
+from app.services.proxy_health import ProxyHealth
 
 _settings = load_settings()
 _cache = CacheManager(_settings.data_cache_dir)
@@ -23,6 +24,7 @@ _f1tv_auth = F1TVAuth(
     require_proxy=_settings.f1tv_require_proxy,
     proxy_urls=_historical_service.get_proxy_urls,
 )
+_proxy_health = ProxyHealth(proxy_urls=_historical_service.get_proxy_urls)
 _live_service = LiveSessionService(
     historical=_historical_service,
     live_data_dir=_settings.live_data_dir,
@@ -46,6 +48,10 @@ def get_settings() -> Settings:
 
 def get_f1tv_auth() -> F1TVAuth:
     return _f1tv_auth
+
+
+def get_proxy_health() -> ProxyHealth:
+    return _proxy_health
 
 
 def get_historical_service() -> HistoricalService:

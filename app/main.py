@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.deps import get_f1tv_auth, get_historical_service, get_prefetch_scheduler, get_settings
+from app.deps import get_f1tv_auth, get_historical_service, get_prefetch_scheduler, get_proxy_health, get_settings
 from app.routes.f1 import router as f1_router
 
 
@@ -19,10 +19,12 @@ async def lifespan(_: FastAPI):
     f1tv_auth = get_f1tv_auth()
     f1tv_auth.tokens.install()
     f1tv_renewal = asyncio.create_task(f1tv_auth.run())
+    proxy_checks = asyncio.create_task(get_proxy_health().run())
     if settings.prefetch_enabled:
         prefetch_scheduler.start()
     yield
     prefetch_scheduler.stop()
+    proxy_checks.cancel()
     f1tv_renewal.cancel()
     historical_service.executor.shutdown(wait=False, cancel_futures=True)
 
