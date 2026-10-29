@@ -1,0 +1,17 @@
+[Unit]
+Description=lap-vision-f1 reverse SSH tunnel (local SOCKS5 -> VPS loopback)
+Wants=network-online.target f1-socks.service
+After=network-online.target f1-socks.service
+# Never stop retrying - the board has nothing else to do.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/f1-tunnel/tunnel.env
+ExecStart=/usr/local/lib/f1-tunnel/f1-tunnel.sh
+User=f1tunnel
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

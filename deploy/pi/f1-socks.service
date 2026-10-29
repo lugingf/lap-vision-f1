@@ -1,0 +1,14 @@
+[Unit]
+Description=lap-vision-f1 local SOCKS5 proxy (microsocks, loopback only)
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/f1-tunnel/tunnel.env
+ExecStart=/usr/local/bin/microsocks -i 127.0.0.1 -p ${SOCKS_PORT}
+User=f1tunnel
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

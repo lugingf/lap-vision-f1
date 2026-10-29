@@ -1,0 +1,7 @@
+[Unit]
+Description=lap-vision-f1 tunnel health check (Wi-Fi, local SOCKS, end-to-end via VPS)
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/f1-tunnel/tunnel.env
+ExecStart=/usr/local/lib/f1-tunnel/f1-tunnel-watchdog.sh
