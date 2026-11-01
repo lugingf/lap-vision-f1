@@ -282,6 +282,17 @@ class InstallTests(unittest.TestCase):
         F1TVTokens(self.dir / "store.json", self.dir / "f1auth.json").install()
         self.assertEqual(get_token().value, by_hand)
 
+    def test_a_process_whose_token_ran_out_takes_the_one_signed_in_for_since(self) -> None:
+        from fastf1.internals.f1account import get_token, token_manager
+        from fastf1.internals.f1account.tokens import SubscriptionToken
+
+        _store(self.dir / "store.json", _jwt(-60))
+        F1TVTokens(self.dir / "store.json", self.dir / "f1auth.json").install()
+        token_manager._token = SubscriptionToken(value=_jwt(-60), expires_at=time.time() - 60)
+        fresh = _jwt(4 * 24 * 3600)
+        _store(self.dir / "store.json", fresh)
+        self.assertEqual(get_token().value, fresh)
+
     def test_what_goes_to_the_other_processes_holds_no_password(self) -> None:
         import pickle
 

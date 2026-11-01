@@ -119,8 +119,12 @@ class F1TVTokens:
         from fastf1.internals.f1account import token_manager  # type: ignore
         from fastf1.internals.f1account.tokens import SubscriptionToken, TokenStore  # type: ignore
 
+        # FastF1 reads the store only while it holds no token: once the one in memory runs out it asks
+        # here, so the token the service signed in for since is looked for here too, not only the one
+        # put by hand. Asking the hand-put file alone left the workers on the anonymous feed from the
+        # moment their first token ran out, beside a fresh one on disk.
         def from_fallback() -> SubscriptionToken:
-            token = self._fallback()
+            token = self.token()
             if not _is_valid(token, time.time()):
                 raise F1AuthError("no F1TV token yet: the service signs in, this process only reads it")
             return SubscriptionToken.from_jwt(token)
