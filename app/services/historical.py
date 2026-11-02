@@ -68,7 +68,40 @@ def _import_fastf1(cache_dir: str):
     cache_path = Path(cache_dir)
     cache_path.mkdir(parents=True, exist_ok=True)
     fastf1.Cache.enable_cache(cache_path)
+    _read_streams_in_hours(fastf1)
     return fastf1
+
+
+# A stream's time from its opening, past a day: '1.01:46:26.209'.
+_DAYS_INTO_STREAM = re.compile(r"^(\d+)\.(\d{2}):(?=\d{2}:\d{2}\.\d{3})", re.MULTILINE)
+
+
+def _stream_in_hours(text: str) -> str:
+    """A jsonStream with each time past a day written in hours instead: '1.01:46:26.209' becomes
+    '25:46:26.209'. FastF1 takes the first twelve characters of a line as its time; a stream opened
+    the day before its session - Mexico 2026's race - runs past a day, and not one line of it parsed."""
+    return _DAYS_INTO_STREAM.sub(lambda match: f"{int(match[1]) * 24 + int(match[2]):02d}:", text)
+
+
+def _read_streams_in_hours(fastf1: Any) -> None:
+    """Have FastF1 read every jsonStream it fetches with its times in hours. Once a process."""
+    cache = fastf1.req.Cache
+    if getattr(cache.requests_get, "_streams_in_hours", False):
+        return
+    fetch = cache.requests_get
+
+    def requests_get(url: Any, **kwargs: Any) -> Any:
+        response = fetch(url, **kwargs)
+        urls = [url] if isinstance(url, str) else list(url)
+        if response.status_code == 200 and any(".jsonStream" in each for each in urls):
+            text = response.content.decode("utf-8-sig")
+            in_hours = _stream_in_hours(text)
+            if in_hours != text:
+                response._content = in_hours.encode()
+        return response
+
+    requests_get._streams_in_hours = True  # type: ignore[attr-defined]
+    cache.requests_get = staticmethod(requests_get)
 
 
 def _prewarm_session_cache(session: Any, *, laps: bool, telemetry: bool, weather: bool, messages: bool) -> None:
@@ -784,13 +817,14 @@ def fetch_telemetry_compare_payload(
 
     def _load() -> Any:
         session = fastf1.get_session(request.year, request.event, request.session)
-        _prewarm_session_cache(session, laps=True, telemetry=True, weather=False, messages=False)
-        session.load(
-            laps=True,
-            telemetry=True,
-            weather=False,
-            messages=False,
-        )
+        with _reading(fastf1, session, request.refresh):
+            _prewarm_session_cache(session, laps=True, telemetry=True, weather=False, messages=False)
+            session.load(
+                laps=True,
+                telemetry=True,
+                weather=False,
+                messages=False,
+            )
         return session
 
     session = _with_proxy_pool(proxy_urls, _load)
@@ -841,13 +875,14 @@ def fetch_race_playback_payload(
 
     def _load() -> Any:
         session = fastf1.get_session(request.year, request.event, request.session)
-        _prewarm_session_cache(session, laps=True, telemetry=True, weather=False, messages=False)
-        session.load(
-            laps=True,
-            telemetry=True,
-            weather=False,
-            messages=False,
-        )
+        with _reading(fastf1, session, request.refresh):
+            _prewarm_session_cache(session, laps=True, telemetry=True, weather=False, messages=False)
+            session.load(
+                laps=True,
+                telemetry=True,
+                weather=False,
+                messages=False,
+            )
         return session
 
     session = _with_proxy_pool(proxy_urls, _load)
@@ -1108,14 +1143,7 @@ def fetch_session_payload(
 
     def _load() -> Any:
         session = fastf1.get_session(request.year, request.event, request.session)
-        reading: Any = nullcontext()
-        if request.refresh:
-            # FastF1 keeps what it parsed of a session for good: one parsed while the archive held
-            # only part of it stays that part however often it is loaded. A reload drops it and
-            # reads the archive past the HTTP cache, and what it reads is kept as the session.
-            _forget_parsed_session(fastf1, session)
-            reading = fastf1.Cache.disabled(disable_http_cache=True, disable_func_cache=False)
-        with reading:
+        with _reading(fastf1, session, request.refresh):
             _prewarm_session_cache(
                 session,
                 laps=request.include_laps,
@@ -1133,6 +1161,16 @@ def fetch_session_payload(
 
     session = _with_proxy_pool(proxy_urls, _load)
     return _session_to_bundle_payload(session, request)
+
+
+def _reading(fastf1: Any, session: Any, refresh: bool) -> Any:
+    """How a session is read from FastF1. FastF1 keeps what it parsed of a session for good: one
+    parsed while the archive held only part of it stays that part however often it is loaded. A
+    reload drops it and reads the archive past the HTTP cache, and what it reads is kept."""
+    if not refresh:
+        return nullcontext()
+    _forget_parsed_session(fastf1, session)
+    return fastf1.Cache.disabled(disable_http_cache=True, disable_func_cache=False)
 
 
 def _forget_parsed_session(fastf1: Any, session: Any) -> None:

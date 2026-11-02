@@ -503,6 +503,98 @@ class RefreshedSessionTests(unittest.TestCase):
         self.assertEqual(after, {"laps": 71})
 
 
+class RefreshedPlaybackTests(unittest.TestCase):
+    """A playback is made from the same parsed session: a reload of it must read the archive again too."""
+
+    def test_a_reloaded_playback_reads_the_archive_again(self) -> None:
+        import tempfile
+
+        import fastf1
+        from fastf1.req import Cache
+
+        from app.services import historical
+
+        archive = {"laps": 2}
+        seen: list[int] = []
+        http_cache_off: list[bool] = []
+
+        @Cache.api_request_wrapper
+        def position_data(api_path: str) -> dict:
+            http_cache_off.append(Cache._http_tmp_disabled)
+            return {"laps": archive["laps"]}
+
+        class Session:
+            api_path = "/static/2026/2026-11-01_Mexico_City_Grand_Prix/2026-11-01_Race/"
+
+            def load(self, **kwargs: object) -> None:
+                seen.append(position_data(self.api_path)["laps"])
+
+        def load(cache_dir: str, refresh: bool) -> None:
+            request = {"year": 2026, "event": 19, "session": "Race", "refresh": refresh}
+            with (
+                mock.patch.object(fastf1, "get_session", lambda *args: Session()),
+                mock.patch.object(historical, "_prewarm_session_cache", lambda *args, **kwargs: None),
+            ):
+                historical.fetch_race_playback_payload(request, cache_dir)
+
+        with tempfile.TemporaryDirectory() as cache_dir:
+            load(cache_dir, refresh=False)
+            archive["laps"] = 71
+            load(cache_dir, refresh=False)
+            load(cache_dir, refresh=True)
+
+        self.assertEqual(seen, [2, 2, 71])
+        self.assertEqual(http_cache_off, [False, True])
+
+
+class StreamTimestampsPastADayTests(unittest.TestCase):
+    """Mexico 2026's race streams were opened a day before the race, and their timestamps ran past a
+    day: '1.01:46:26.209'. FastF1 takes the first twelve characters of a line as its time, so not one
+    line of the race parsed, and the race came out with no laps, no messages and no lap count."""
+
+    def test_a_timestamp_past_a_day_is_written_in_hours(self) -> None:
+        from app.services.historical import _stream_in_hours
+
+        stream = '00:00:00.000{"Status":"1"}\r\n1.01:46:26.209{"CurrentLap":1}\r\n2.03:00:00.500{"CurrentLap":2}\r\n'
+
+        self.assertEqual(
+            stream_lines(_stream_in_hours(stream)),
+            ['00:00:00.000{"Status":"1"}', '25:46:26.209{"CurrentLap":1}', '51:00:00.500{"CurrentLap":2}'],
+        )
+
+    def test_fastf1_reads_a_stream_past_a_day(self) -> None:
+        import fastf1
+        import requests
+        from fastf1 import _api
+        from fastf1.req import Cache
+
+        from app.services import historical
+
+        response = requests.Response()
+        response.status_code = 200
+        stream = '\ufeff1.01:46:26.209{"CurrentLap":1,"TotalLaps":71}\r\n1.02:42:17.291{"CurrentLap":2}\r\n'
+        response._content = stream.encode()
+        with tempfile_cache() as cache_dir, mock.patch.object(Cache, "_request", lambda *args, **kwargs: response):
+            historical._import_fastf1(cache_dir)
+            with fastf1.Cache.disabled():
+                lines = _api.fetch_page("/static/2026/2026-11-01_Mexico_City_Grand_Prix/2026-11-01_Race/", "lap_count")
+
+        self.assertEqual(
+            lines,
+            [["25:46:26.209", {"CurrentLap": 1, "TotalLaps": 71}], ["26:42:17.291", {"CurrentLap": 2}]],
+        )
+
+
+def stream_lines(stream: str) -> list[str]:
+    return [line for line in stream.split("\r\n") if line]
+
+
+def tempfile_cache():
+    import tempfile
+
+    return tempfile.TemporaryDirectory()
+
+
 class CachedSessionLapDriverTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_cached_bundle_with_a_lap_of_nobody_is_loaded_again(self) -> None:
         from pathlib import Path

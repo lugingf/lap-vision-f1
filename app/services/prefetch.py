@@ -6,7 +6,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from app.cache import CacheManager
-from app.domain.models import RacePlaybackRequest, SessionRequest
+from app.domain.models import RacePlaybackRequest, ScheduleEvent, SessionRequest
 from app.services.historical import HistoricalService
 from app.services.live import LiveSessionService
 
@@ -15,6 +15,10 @@ _logger = logging.getLogger("lap-vision-f1.prefetch")
 _STATE_KEY = "runtime/prefetch-state.json"
 _MAX_ATTEMPTS = 12
 _POST_SESSION_BUFFER = timedelta(minutes=45)
+# How long a session may run. A race may run three hours with its suspensions, the most the rules
+# allow; the others run an hour.
+_RACE_LENGTH = timedelta(hours=3)
+_SESSION_LENGTH = timedelta(hours=1)
 # The floor between two attempts at the same session, whether or not this tick's miss counts
 # against `_MAX_ATTEMPTS`. A session too early to have data yet was being retried every tick
 # (every `interval_seconds`, 5 minutes by default) with no backoff at all for as long as it stayed
@@ -112,8 +116,13 @@ class SessionPrefetchScheduler:
                     continue
                 if self._on_cooldown(entry, now):
                     continue
+                # A session loaded before it is over is kept as it was then: Mexico 2026's race,
+                # loaded twelve hours before its start, stayed two laps long for good.
+                ready_at = self._ready_at(event, session_name)
+                if ready_at is not None and now < ready_at:
+                    continue
 
-                done, had_data = await self._prefetch_one(now.year, event.round_number, session_name)
+                done, had_data = await self._prefetch_one(now.year, event.round_number, session_name, ready_at)
                 entry["last_attempt_at"] = now.isoformat()
                 if had_data:
                     # The session exists and is returning something - either still in progress
@@ -153,6 +162,23 @@ class SessionPrefetchScheduler:
         return today - timedelta(days=lookback_days) <= event_date <= today + timedelta(days=1)
 
     @staticmethod
+    def _ready_at(event: ScheduleEvent, session_name: str) -> datetime | None:
+        """When a session is over and its data is in the archive: its start, as long as it may run,
+        and the buffer the archive takes. None for a session the calendar does not time."""
+        for session in event.sessions:
+            if session.session_name != session_name or not session.starts_at:
+                continue
+            try:
+                starts_at = datetime.fromisoformat(session.starts_at)
+            except ValueError:
+                return None
+            if starts_at.tzinfo is None:
+                starts_at = starts_at.replace(tzinfo=UTC)
+            length = _RACE_LENGTH if session_name.strip().lower() == "race" else _SESSION_LENGTH
+            return starts_at + length + _POST_SESSION_BUFFER
+        return None
+
+    @staticmethod
     def _on_cooldown(entry: dict[str, Any], now: datetime) -> bool:
         last_attempt_iso = entry.get("last_attempt_at")
         if not last_attempt_iso:
@@ -165,10 +191,16 @@ class SessionPrefetchScheduler:
             last_attempt = last_attempt.replace(tzinfo=UTC)
         return now - last_attempt < _RETRY_COOLDOWN
 
-    async def _prefetch_one(self, year: int, round_number: int, session_name: str) -> tuple[bool, bool]:
-        """Returns (done, had_data). `done` only turns True once the session's own scheduled end
-        time (plus a buffer) has passed - not just because *some* data came back, since a session
-        in progress will happily return partial laps/positions well before it's actually over.
+    async def _prefetch_one(
+        self, year: int, round_number: int, session_name: str, ready_at: datetime | None
+    ) -> tuple[bool, bool]:
+        """Returns (done, had_data). `done` only turns True once the session is over - after
+        `ready_at`, or the session's own scheduled end plus a buffer - not just because *some* data
+        came back, since a session in progress will happily return partial laps/positions well
+        before it's actually over. A session whose end is known neither way is not taken as final.
+
+        Every load here reads the archive afresh: whatever an earlier load left in the caches - one
+        from a reader during the session - is what this one is here to replace.
         """
         _logger.info("prefetch: %s round %s %s", year, round_number, session_name)
         bundle = None
@@ -183,6 +215,7 @@ class SessionPrefetchScheduler:
                     include_weather=True,
                     include_messages=True,
                     include_telemetry=False,
+                    refresh=True,
                 )
             )
             got_laps = len(bundle.laps) > 0
@@ -197,6 +230,7 @@ class SessionPrefetchScheduler:
                     event=round_number,
                     session=session_name,
                     include_telemetry=False,
+                    refresh=True,
                 )
             )
             got_playback = playback.available
@@ -218,6 +252,7 @@ class SessionPrefetchScheduler:
                         session=session_name,
                         sample_step_ms=self._playback_detail_step_ms,
                         include_telemetry=False,
+                        refresh=True,
                     )
                 )
             except Exception:
@@ -232,15 +267,17 @@ class SessionPrefetchScheduler:
         if not had_data:
             return False, False
 
+        if ready_at is not None:
+            return datetime.now(UTC) >= ready_at, True
+
         scheduled_end = bundle.descriptor.scheduled_end if bundle is not None else None
         if not scheduled_end:
-            # No scheduled end time known - fall back to trusting the data as final, as before.
-            return True, True
+            return False, True
 
         try:
             end_at = datetime.fromisoformat(scheduled_end)
         except ValueError:
-            return True, True
+            return False, True
         if end_at.tzinfo is None:
             end_at = end_at.replace(tzinfo=UTC)
 
