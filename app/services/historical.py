@@ -9,7 +9,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ProcessPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, TypeVar
@@ -1108,23 +1108,41 @@ def fetch_session_payload(
 
     def _load() -> Any:
         session = fastf1.get_session(request.year, request.event, request.session)
-        _prewarm_session_cache(
-            session,
-            laps=request.include_laps,
-            telemetry=request.include_telemetry,
-            weather=request.include_weather,
-            messages=request.include_messages,
-        )
-        session.load(
-            laps=request.include_laps,
-            telemetry=request.include_telemetry,
-            weather=request.include_weather,
-            messages=request.include_messages,
-        )
+        reading: Any = nullcontext()
+        if request.refresh:
+            # FastF1 keeps what it parsed of a session for good: one parsed while the archive held
+            # only part of it stays that part however often it is loaded. A reload drops it and
+            # reads the archive past the HTTP cache, and what it reads is kept as the session.
+            _forget_parsed_session(fastf1, session)
+            reading = fastf1.Cache.disabled(disable_http_cache=True, disable_func_cache=False)
+        with reading:
+            _prewarm_session_cache(
+                session,
+                laps=request.include_laps,
+                telemetry=request.include_telemetry,
+                weather=request.include_weather,
+                messages=request.include_messages,
+            )
+            session.load(
+                laps=request.include_laps,
+                telemetry=request.include_telemetry,
+                weather=request.include_weather,
+                messages=request.include_messages,
+            )
         return session
 
     session = _with_proxy_pool(proxy_urls, _load)
     return _session_to_bundle_payload(session, request)
+
+
+def _forget_parsed_session(fastf1: Any, session: Any) -> None:
+    """Remove FastF1's parsed data of one session from its cache, so the next load parses it anew."""
+    api_path = getattr(session, "api_path", None)
+    if not api_path:
+        return
+    folder = Path(fastf1.req.Cache._get_cache_file_path(api_path, "session")).parent
+    for parsed in folder.glob("*.ff1pkl"):
+        parsed.unlink(missing_ok=True)
 
 
 def _lap_driver_code(row: Any, codes_by_number: dict[str, str]) -> str:

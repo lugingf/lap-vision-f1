@@ -449,6 +449,60 @@ class LiveSnapshotCacheTests(unittest.TestCase):
         self.assertIs(Cache._requests_session, online)
 
 
+class RefreshedSessionTests(unittest.TestCase):
+    """A session FastF1 parsed while the archive still held part of it keeps that part in its
+    parsed-data cache for good: a reload asked for must read the archive again."""
+
+    def _load(self, cache_dir: str, archive: dict, refresh: bool) -> tuple[dict, list[bool]]:
+        import fastf1
+        from fastf1.req import Cache
+
+        from app.services import historical
+
+        http_cache_off: list[bool] = []
+
+        @Cache.api_request_wrapper
+        def timing_data(api_path: str) -> dict:
+            http_cache_off.append(Cache._http_tmp_disabled)
+            return {"laps": archive["laps"]}
+
+        class Session:
+            api_path = "/static/2026/2026-11-01_Mexico_City_Grand_Prix/2026-11-01_Race/"
+
+            def load(self, **kwargs: object) -> None:
+                self.parsed = timing_data(self.api_path)
+
+        request = {"year": 2026, "event": 19, "session": "Race", "refresh": refresh}
+        with (
+            mock.patch.object(fastf1, "get_session", lambda *args: Session()),
+            mock.patch.object(historical, "_prewarm_session_cache", lambda *args, **kwargs: None),
+            mock.patch.object(historical, "_session_to_bundle_payload", lambda session, request: session.parsed),
+        ):
+            return historical.fetch_session_payload(request, cache_dir), http_cache_off
+
+    def test_a_reload_reads_the_archive_again_and_keeps_what_it_read(self) -> None:
+        import tempfile
+
+        from fastf1.req import Cache
+
+        archive = {"laps": 2}
+        with tempfile.TemporaryDirectory() as cache_dir:
+            first, _ = self._load(cache_dir, archive, refresh=False)
+            archive["laps"] = 71
+            cached, _ = self._load(cache_dir, archive, refresh=False)
+            reloaded, http_cache_off = self._load(cache_dir, archive, refresh=True)
+            after, _ = self._load(cache_dir, archive, refresh=False)
+
+            self.assertFalse(Cache._http_tmp_disabled or Cache._func_tmp_disabled)
+
+        self.assertEqual(first, {"laps": 2})
+        # Without a reload the parsed session stands, as it should for a finished one.
+        self.assertEqual(cached, {"laps": 2})
+        self.assertEqual(reloaded, {"laps": 71})
+        self.assertEqual(http_cache_off, [True])
+        self.assertEqual(after, {"laps": 71})
+
+
 class CachedSessionLapDriverTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_cached_bundle_with_a_lap_of_nobody_is_loaded_again(self) -> None:
         from pathlib import Path
