@@ -323,6 +323,40 @@ class ReferenceTrackPolylineTests(unittest.TestCase):
         self.assertEqual(points[0], {"x": 2000.0, "y": 0.0})
 
 
+class DriverPlaceholderTests(unittest.TestCase):
+    """Mexico 2026's race listed Hirakawa, driving for Haas that weekend, with no first name, last
+    name, team or colour. FastF1 wrote what was missing as 'None None', 'None' and 'None', and the
+    site stored him as a driver called 'None None' of a team called 'None'."""
+
+    def test_what_fastf1_could_not_tell_goes_out_as_nothing(self) -> None:
+        results = pd.DataFrame(
+            {
+                "Abbreviation": ["VER", "HIR"],
+                "DriverNumber": ["1", "50"],
+                "FullName": ["Max Verstappen", "None None"],
+                "TeamName": ["Red Bull Racing", "None"],
+                "TeamColor": ["3671C6", "None"],
+                "Position": [1.0, 13.0],
+            }
+        )
+        session = mock.Mock(spec=["results"])
+        session.results = results
+        request = SessionRequest(
+            year=2026, event=19, session="Race", include_laps=False, include_weather=False, include_messages=False
+        )
+
+        payload = _session_to_bundle_payload(session, request)
+
+        told = {
+            driver["driver_code"]: (driver["full_name"], driver["team_name"], driver["team_color"])
+            for driver in payload["drivers"]
+        }
+        self.assertEqual(told["HIR"], (None, None, None))
+        self.assertEqual(told["VER"], ("Max Verstappen", "Red Bull Racing", "3671C6"))
+        hirakawa = next(row for row in payload["results"] if row["driver_code"] == "HIR")
+        self.assertEqual((hirakawa["full_name"], hirakawa["team_name"]), (None, None))
+
+
 class LapDriverCodeTests(unittest.TestCase):
     """A session FastF1 knows only partly - as a live recording does early on - has laps without a
     driver abbreviation. They used to go out with an empty code, which the backend could not store."""

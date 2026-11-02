@@ -394,6 +394,24 @@ def _to_bool(value: Any) -> bool | None:
     return bool(value)
 
 
+# What FastF1 writes for a name, a team or a colour the timing did not give: str() of the missing
+# value, 'None None' for a missing first and last name.
+_UNTOLD = {"", "none", "none none", "nan", "nan nan"}
+
+
+def _told(value: Any) -> str | None:
+    """A driver's name, team or colour as FastF1 gives it, or None where the timing did not tell it."""
+    if value is None:
+        return None
+    try:
+        if math.isnan(value):
+            return None
+    except TypeError:
+        pass
+    text = str(value).strip()
+    return None if text.lower() in _UNTOLD else text
+
+
 def _normalize_hex_color(value: Any) -> str | None:
     if value is None:
         return None
@@ -1229,9 +1247,9 @@ def _session_to_bundle_payload(session: Any, request: SessionRequest) -> dict[st
             driver_code = row.get("Abbreviation") or row.get("DriverNumber") or ""
             driver_item = {
                 "driver_code": str(driver_code),
-                "full_name": row.get("FullName"),
-                "team_name": row.get("TeamName"),
-                "team_color": row.get("TeamColor"),
+                "full_name": _told(row.get("FullName")),
+                "team_name": _told(row.get("TeamName")),
+                "team_color": _told(row.get("TeamColor")),
                 "permanent_number": _to_int(row.get("DriverNumber")),
             }
             if not any(item["driver_code"] == driver_item["driver_code"] for item in drivers):
@@ -1243,8 +1261,8 @@ def _session_to_bundle_payload(session: Any, request: SessionRequest) -> dict[st
                 {
                     "driver_code": str(driver_code),
                     "position": _to_int(row.get("Position")),
-                    "team_name": row.get("TeamName"),
-                    "full_name": row.get("FullName"),
+                    "team_name": _told(row.get("TeamName")),
+                    "full_name": _told(row.get("FullName")),
                     "grid_position": _to_int(row.get("GridPosition")),
                     "points": _to_float(row.get("Points")),
                     "status": row.get("Status"),
