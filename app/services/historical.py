@@ -20,6 +20,8 @@ from app.cache import CacheManager
 from app.domain.models import (
     RacePlaybackRequest,
     RacePlaybackResponse,
+    RaceTracesRequest,
+    RaceTracesResponse,
     ScheduleResponse,
     SessionBundle,
     SessionRequest,
@@ -883,6 +885,209 @@ def fetch_telemetry_compare_payload(
     }
 
 
+def _cache_key_for_race_traces(request: RaceTracesRequest) -> str:
+    event_slug = _slugify_event(request.event)
+    session_slug = request.session.strip().lower()
+    return f"traces/{request.year}/{event_slug}/{session_slug}/race-traces-v1-{request.bins}.json"
+
+
+def _bin_centres(bins: int) -> Any:
+    import numpy as np
+
+    return (np.arange(bins) + 0.5) / bins
+
+
+def _lap_on_bins(distance: Any, channels: dict[str, Any], centres: Any) -> dict[str, Any] | None:
+    """One lap's channels at even fractions of its own length. No two laps are quite the same length,
+    so each is measured against itself, which keeps a corner at one fraction of the lap whatever
+    line was taken to it. A lap with too few samples to say anything is None."""
+    import numpy as np
+
+    distance = np.asarray(distance, dtype=float)
+    if distance.size < 50 or not np.isfinite(distance[-1]) or distance[-1] <= 0:
+        return None
+    fraction = distance / distance[-1]
+    return {name: np.interp(centres, fraction, np.asarray(values, dtype=float)) for name, values in channels.items()}
+
+
+def _median_trace(laps: list[dict[str, Any]]) -> dict[str, list[float]]:
+    """The typical lap of several: the median speed and throttle at each point, and the share of
+    them on the brake there."""
+    import numpy as np
+
+    speed = np.median([lap["speed"] for lap in laps], axis=0)
+    throttle = np.median([lap["throttle"] for lap in laps], axis=0)
+    brake = np.mean([lap["brake"] for lap in laps], axis=0)
+    return {
+        "speed": [round(float(value), 1) for value in speed],
+        "throttle": [round(float(value), 1) for value in throttle],
+        "brake": [round(float(value), 3) for value in brake],
+    }
+
+
+def _clean_race_laps(driver_laps: Any) -> Any:
+    """The laps of one driver that measure his pace: not the first, not into or out of the pits,
+    run under green flag from start to finish, not deleted, timed, and no more than 7% off his own
+    median — a lap held up in traffic or off the road is no lap to average."""
+    laps = driver_laps[
+        (driver_laps["LapNumber"] > 1)
+        & driver_laps["PitInTime"].isna()
+        & driver_laps["PitOutTime"].isna()
+        & driver_laps["LapTime"].notna()
+    ]
+    if "TrackStatus" in laps.columns:
+        laps = laps[laps["TrackStatus"].astype(str).str.fullmatch("1")]
+    if "Deleted" in laps.columns:
+        laps = laps[~laps["Deleted"].eq(True)]
+    if laps.empty:
+        return laps
+    return laps[laps["LapTime"] <= laps["LapTime"].median() * 1.07]
+
+
+def _corners_from_speed(speed: list[float], drop_kmh: float = 15.0) -> list[dict[str, Any]]:
+    """The corners of a lap as the places it slows down most: every low point of the speed that
+    sits at least drop_kmh under the fastest point on either side of it within a tenth of the lap.
+    Numbered in the order they come, which is not always the circuit's own numbering."""
+    count = len(speed)
+    if count == 0:
+        return []
+    window = max(3, count // 10)
+    near = max(2, count // 100)
+    corners: list[dict[str, Any]] = []
+    last = -count
+    for index in range(count):
+        value = speed[index]
+        around = [speed[(index + offset) % count] for offset in range(-near, near + 1)]
+        if value > min(around):
+            continue
+        left = max(speed[(index - offset) % count] for offset in range(1, window + 1))
+        right = max(speed[(index + offset) % count] for offset in range(1, window + 1))
+        if min(left, right) - value < drop_kmh or index - last <= near:
+            continue
+        last = index
+        corners.append({"number": len(corners) + 1, "letter": "", "fraction": round((index + 0.5) / count, 4)})
+    return corners
+
+
+def _circuit_corners(fastf1: Any, session: Any, lap_length_m: float) -> list[dict[str, Any]] | None:
+    """The circuit's own corners, numbered as it numbers them, from FastF1's circuit information.
+    None when it cannot be had."""
+    try:
+        info = session.get_circuit_info()
+    except Exception:  # noqa: BLE001 - the corners are a garnish; the traces stand without them
+        return None
+    corners = getattr(info, "corners", None)
+    if corners is None or len(corners) == 0 or lap_length_m <= 0:
+        return None
+    out: list[dict[str, Any]] = []
+    for _, corner in corners.iterrows():
+        number = _to_int(corner.get("Number"))
+        distance = _to_float(corner.get("Distance"))
+        if number is None or distance is None:
+            continue
+        letter = corner.get("Letter")
+        out.append(
+            {
+                "number": number,
+                "letter": str(letter) if isinstance(letter, str) else "",
+                "fraction": round(min(max(distance / lap_length_m, 0.0), 1.0), 4),
+            }
+        )
+    return out or None
+
+
+def fetch_race_traces_payload(request_payload: dict[str, Any], cache_dir: str) -> dict[str, Any]:
+    """Every driver's typical lap of a race, from what FastF1 has cached and nothing else.
+
+    The session is read with FastF1 offline: a race that is not in the cache answers as unavailable
+    rather than starting a download, so asking for traces can never be what sends requests to the
+    F1 archive. Only the circuit's corner numbers, a small file of their own, may be fetched once if
+    they are not cached.
+    """
+    fastf1 = _import_fastf1(cache_dir)
+    request = RaceTracesRequest.model_validate(request_payload)
+    bins = max(50, min(request.bins, 2000))
+    payload: dict[str, Any] = {
+        "season_year": request.year,
+        "round_number": _to_int(request.event) if isinstance(request.event, int) else None,
+        "event_name": str(request.event),
+        "session_name": request.session,
+        "available": False,
+        "bins": bins,
+    }
+
+    fastf1.Cache.offline_mode(True)
+    try:
+        try:
+            session = fastf1.get_session(request.year, request.event, request.session)
+            session.load(laps=True, telemetry=True, weather=False, messages=False)
+            laps_frame = session.laps
+        except Exception as error:  # noqa: BLE001 - not cached is an answer, not a failure
+            payload["message"] = f"the session is not in the cache: {error}"
+            return payload
+
+        event = getattr(session, "event", None)
+        payload["round_number"] = _to_int(getattr(event, "RoundNumber", None)) or payload["round_number"]
+        payload["event_name"] = getattr(event, "EventName", None) or payload["event_name"]
+        payload["session_name"] = getattr(session, "name", request.session)
+
+        centres = _bin_centres(bins)
+        drivers: list[dict[str, Any]] = []
+        reference: Any = None
+        for driver_code in sorted({str(code) for code in laps_frame["Driver"].dropna().unique()}):
+            clean = _clean_race_laps(laps_frame.pick_drivers(driver_code))
+            sampled: list[dict[str, Any]] = []
+            for _, lap in clean.iterlaps():
+                try:
+                    telemetry = lap.get_car_data().add_distance()
+                except Exception:  # noqa: BLE001 - a lap with no car data is passed over
+                    continue
+                on_bins = _lap_on_bins(
+                    telemetry["Distance"],
+                    {"speed": telemetry["Speed"], "throttle": telemetry["Throttle"], "brake": telemetry["Brake"]},
+                    centres,
+                )
+                if on_bins is not None:
+                    sampled.append(on_bins)
+                if reference is None or lap["LapTime"] < reference["LapTime"]:
+                    reference = lap
+            if len(sampled) < 3:
+                continue
+            drivers.append({"driver_code": driver_code, "laps_used": len(sampled), **_median_trace(sampled)})
+
+        if not drivers or reference is None:
+            payload["message"] = "no driver has enough clean laps"
+            return payload
+
+        lap_length_m = 0.0
+        try:
+            telemetry = reference.get_telemetry()
+            lap_length_m = float(telemetry["Distance"].iloc[-1])
+            outline = _lap_on_bins(telemetry["Distance"], {"x": telemetry["X"], "y": telemetry["Y"]}, centres)
+            if outline is not None:
+                points = zip(outline["x"], outline["y"], strict=True)
+                payload["outline"] = [{"x": round(float(x), 1), "y": round(float(y), 1)} for x, y in points]
+        except Exception:  # noqa: BLE001 - the outline is a garnish; the traces stand without it
+            pass
+        payload["lap_length_m"] = round(lap_length_m, 1) if lap_length_m > 0 else None
+
+        corners = _circuit_corners(fastf1, session, lap_length_m)
+        if corners is None:
+            fastf1.Cache.offline_mode(False)
+            corners = _circuit_corners(fastf1, session, lap_length_m)
+        if corners is not None:
+            payload["corners"], payload["corners_source"] = corners, "circuit_info"
+        else:
+            fastest = min(drivers, key=lambda driver: sum(1.0 / max(value, 1.0) for value in driver["speed"]))
+            payload["corners"], payload["corners_source"] = _corners_from_speed(fastest["speed"]), "speed"
+
+        payload["drivers"] = drivers
+        payload["available"] = True
+        return payload
+    finally:
+        fastf1.Cache.offline_mode(False)
+
+
 def fetch_race_playback_payload(
     request_payload: dict[str, Any], cache_dir: str, proxy_urls: list[str] | None = None
 ) -> dict[str, Any]:
@@ -1571,6 +1776,30 @@ class HistoricalService:
         payload["cache_hit"] = False
         payload["cache_key"] = cache_key
         return TelemetryCompareResponse.model_validate(payload)
+
+    async def race_traces(self, request: RaceTracesRequest) -> RaceTracesResponse:
+        """Every driver's typical lap of a race. Computed once and kept: a race that has been run
+        does not change, and an answer that the race was not cached is not kept, so it is tried
+        again once the race has been loaded."""
+        cache_key = _cache_key_for_race_traces(request)
+        if not request.refresh:
+            cached = self.cache.read_json(cache_key)
+            if cached is not None:
+                cached["cache_hit"] = True
+                cached["cache_key"] = cache_key
+                return RaceTracesResponse.model_validate(cached)
+
+        payload = await self._compute_once(
+            cache_key,
+            fetch_race_traces_payload,
+            request.model_dump(mode="json"),
+            str(self.fastf1_cache_dir),
+        )
+        if payload.get("available"):
+            self.cache.write_json(cache_key, payload)
+        payload["cache_hit"] = False
+        payload["cache_key"] = cache_key
+        return RaceTracesResponse.model_validate(payload)
 
     async def race_playback(self, request: RacePlaybackRequest) -> RacePlaybackResponse:
         # What is computed and cached is always the whole race; the window is cut from it on the

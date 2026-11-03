@@ -242,6 +242,58 @@ class TelemetryCompareResponse(BaseModel):
     cache_key: str
 
 
+class RaceTracesRequest(BaseModel):
+    """Every driver's representative lap of a race, read from what FastF1 has already cached."""
+
+    year: int
+    event: str | int
+    session: str
+    bins: int = 400
+    refresh: bool = False
+
+
+class RaceTracePoint(BaseModel):
+    x: float
+    y: float
+
+
+class RaceTraceCorner(BaseModel):
+    number: int
+    letter: str = ""
+    # Where the corner is along the lap, from 0 at the line to 1 back at it.
+    fraction: float
+
+
+class RaceDriverTrace(BaseModel):
+    """One driver's lap as the median of his clean laps, sampled at even fractions of the lap."""
+
+    driver_code: str
+    laps_used: int
+    speed: list[float]
+    throttle: list[float]
+    # The share of the laps on the brake at each point, 0 to 1.
+    brake: list[float]
+
+
+class RaceTracesResponse(BaseModel):
+    season_year: int
+    round_number: int | None = None
+    event_name: str
+    session_name: str
+    available: bool
+    message: str | None = None
+    bins: int
+    lap_length_m: float | None = None
+    outline: list[RaceTracePoint] = []
+    corners: list[RaceTraceCorner] = []
+    # "circuit_info" when the corners are the circuit's own numbers, "speed" when they were found
+    # from the slow points of the lap and are numbered in order.
+    corners_source: str | None = None
+    drivers: list[RaceDriverTrace] = []
+    cache_hit: bool = False
+    cache_key: str = ""
+
+
 class RacePlaybackRequest(BaseModel):
     year: int
     event: str | int

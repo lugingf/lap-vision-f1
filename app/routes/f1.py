@@ -16,6 +16,8 @@ from app.domain.models import (
     ProxySettingsResponse,
     RacePlaybackRequest,
     RacePlaybackResponse,
+    RaceTracesRequest,
+    RaceTracesResponse,
     ScheduleResponse,
     ServiceOverview,
     SessionBundle,
@@ -121,6 +123,18 @@ async def telemetry_compare(
     historical_service: HistoricalServiceDep,
 ) -> TelemetryCompareResponse:
     return await historical_service.telemetry_compare(request)
+
+
+@router.post(
+    "/v1/telemetry/race-traces",
+    response_model=RaceTracesResponse,
+    dependencies=[Depends(require_internal_token)],
+)
+async def race_traces(
+    request: RaceTracesRequest,
+    historical_service: HistoricalServiceDep,
+) -> RaceTracesResponse:
+    return await historical_service.race_traces(request)
 
 
 @router.post(
