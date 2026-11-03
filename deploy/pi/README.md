@@ -38,18 +38,42 @@
 
 ## 1. Записать карту (на Mac)
 
-1. Скачать Armbian для Orange Pi Zero 3: <https://www.armbian.com/orange-pi-zero-3/>, вариант
-   **Minimal / IOT** (Debian или Ubuntu — без разницы). Desktop не нужен.
-2. Записать `.img.xz` на microSD через [balenaEtcher](https://etcher.balena.io/) или
-   Raspberry Pi Imager → *Use custom*.
+1. Скачать Armbian для Orange Pi Zero 3: <https://www.armbian.com/orange-pi-zero-3/> → *Direct
+   download*, вариант **Minimal (CLI)** (Debian или Ubuntu — без разницы, Xfce не нужен). Плата
+   поддерживается сообществом, стабильных сборок нет — только *Rolling Release*; стоит
+   `Armbian_community_26.11.0-trunk.108_Orangepizero3_resolute_current_6.18.57_minimal.img.xz`.
+2. **Не на рабочем Mac:** Intune-профиль (`mount-controls` → `harddisk-external` → `eject`) сразу
+   отключает любой внешний диск, карту там не видит ни Etcher, ни `diskutil`. Нужен другой
+   компьютер или Android + USB-картридер + EtchDroid.
+3. Распаковать образ: `xz -dk <файл>.img.xz`. Сжатый `.img.xz` balenaEtcher не берёт («Something
+   went wrong… check that the archive is not corrupted»), хотя `xz -t` он проходит.
+4. Записать `.img` — надёжнее всего `dd` (`diskutil list external` → карта ~32 ГБ, номер `N`;
+   чужой номер сотрёт не тот диск):
+   ```bash
+   diskutil unmountDisk /dev/diskN
+   sudo dd if=<файл>.img of=/dev/rdiskN bs=4m status=progress && sync
+   diskutil eject /dev/diskN
+   ```
+   Или Armbian Imager (сам скачивает и пишет). На «диск не читается — инициализировать?» —
+   *Игнорировать*: это ext4.
 
 ## 2. Первый запуск
 
 Плата без экрана, поэтому в первый раз проще всего через кабель:
 
 1. Вставить карту, подключить плату **Ethernet-кабелем к роутеру**, питание USB-C 5 В / 2 А+.
-2. Через минуту-две найти её IP в списке DHCP-клиентов роутера (имя `orangepizero3`).
+   Загрузилась — мигает красный светодиод, на разъёме Ethernet горит зелёный. Первая загрузка
+   идёт 3–5 минут (расширение ФС на всю карту).
+2. Найти её IP. Дома две сети: главный роутер `192.168.70.x` (в него воткнута плата) и Wi-Fi 5 ГГц
+   за вторым роутером `192.168.1.x` (на нём Mac); MikroTik-мост адреса плате не выдал. Из
+   `192.168.1.x` сеть `192.168.70.x` видна через NAT, так что ищем открытый SSH там (было
+   `192.168.70.18`):
+   ```bash
+   for i in $(seq 2 254); do (nc -z -G 2 192.168.70.$i 22 2>/dev/null && echo 192.168.70.$i) & done; wait
+   ```
+   Шлюз за Wi-Fi роутером, если сети поменяются: `traceroute -n -m 3 1.1.1.1`.
 3. `ssh root@<IP>`, пароль `1234`. Armbian попросит сменить пароль root и создать пользователя.
+4. Свой ключ: `ssh-copy-id -i ~/.ssh/id_ed25519.pub root@<IP>` (и `ubuntu@<IP>` для пользователя).
 
 Без кабеля: micro-HDMI + USB-клавиатура, дальше те же шаги в консоли.
 
@@ -72,8 +96,10 @@ WIFI_SSID='Моя сеть' WIFI_PASSWORD='пароль' SOCKS_PORT=1082 bash /r
 ip -4 addr show wlan0     # должен появиться IP
 ```
 
-Wi-Fi 5 ГГц плата тоже видит, но 2.4 ГГц обычно стабильнее через стены. После установки плата
-доступна по имени: `ssh root@orangepizero3.local`.
+Wi-Fi 5 ГГц плата тоже видит, но 2.4 ГГц обычно стабильнее через стены. Кабель можно не вынимать:
+пока он есть, трафик идёт по нему, Wi-Fi остаётся запасным. Имя `orangepizero3.local` (avahi)
+срабатывает через раз — Wi-Fi роутер теряет mDNS; надёжнее алиасы в `~/.ssh/config` на Mac:
+`ssh opi` (`192.168.70.18`) и `ssh opi-remote` (через VPS, см. ниже).
 
 Скрипт напечатает в конце строку для `authorized_keys` — она нужна в следующем шаге. Повторный
 запуск безопасен (ключ не перегенерируется); перезапускать после смены настроек или сети.
@@ -93,13 +119,14 @@ Wi-Fi 5 ГГц плата тоже видит, но 2.4 ГГц обычно ст
 2. Чтобы sshd сам быстро замечал мёртвые туннели (иначе после обрыва Wi-Fi старая сессия держит
    порт до двух часов, и новый туннель не встаёт):
    ```bash
-   printf 'ClientAliveInterval 15\nClientAliveCountMax 3\n' | sudo tee /etc/ssh/sshd_config.d/10-keepalive.conf
+   printf 'ClientAliveInterval 15\nClientAliveCountMax 3\n' | sudo tee /etc/ssh/sshd_config.d/20-f1-tunnel-keepalive.conf
    sudo sshd -t && sudo systemctl reload ssh
    ```
-   Это поможет и туннелю телефона.
-3. Добавить `1082` в GitHub-переменную `F1_PROXY_TUNNEL_PORTS` (например `1080,1081,1082`) и
-   передеплоить: `deploy_f1.sh` перегенерирует `f1-proxy-relay`, а тот в течение минуты
-   зарегистрирует `socks5h://172.18.0.1:1082`, как только на порту появится туннель.
+   Это поможет и туннелю телефона. `10-lapvision.conf` рядом ведёт lv-server — его не трогать.
+3. `1082` должен быть в GitHub-переменной `F1_PROXY_TUNNEL_PORTS` (сейчас `1080,1081,1082,1083` —
+   уже есть). Если нет — добавить и запустить деплой f1 вручную: `deploy_f1.sh` перегенерирует
+   `f1-proxy-relay`, а тот в течение минуты зарегистрирует `socks5h://172.18.0.1:1082`, как только
+   на порту появится туннель.
 
 ## 6. Проверить
 
@@ -142,3 +169,14 @@ lap-vision-f1 раз в 2 минуты запрашивает через каж�
 ```bash
 ssh -J ubuntu@95.179.154.60 -p 2222 <пользователь>@127.0.0.1
 ```
+
+## Всё заново / смена VPS
+
+- **Новая карта или переустановка.** Шаги 1–6; ключ платы будет новым — на VPS в
+  `~ubuntu/.ssh/authorized_keys` заменить строку `… f1-tunnel@orangepizero3` на новую из вывода
+  `install.sh` (старую удалить). На Mac: `ssh-keygen -R 192.168.70.18` (у платы новый host key) и,
+  если IP другой, поправить `HostName`/`HostKeyAlias` у `opi`/`opi-remote` в `~/.ssh/config`.
+- **У VPS сменился IP.** Плата сама не узнает — из дома (`opi-remote` в этот момент не работает):
+  `ssh opi`, затем `TUNNEL_HOST=<новый IP> SOCKS_PORT=1082 bash /root/f1-pi/install.sh` (Wi-Fi и ключ
+  сохранятся). На Mac — `ProxyJump` у `opi-remote`.
+- **Новый сервер.** Плюс шаг 5 на нём целиком; relay и порт поднимет ручной деплой f1.
