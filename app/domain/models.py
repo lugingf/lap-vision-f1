@@ -231,6 +231,14 @@ class TelemetryLapTrace(BaseModel):
     samples: list[TelemetrySample]
 
 
+class TelemetryCorner(BaseModel):
+    """A corner as the circuit numbers it, and how far round the lap it is."""
+
+    number: int
+    letter: str = ""
+    distance_m: float
+
+
 class TelemetryCompareResponse(BaseModel):
     season_year: int
     round_number: int | None = None
@@ -238,6 +246,7 @@ class TelemetryCompareResponse(BaseModel):
     session_name: str
     lap_a: TelemetryLapTrace
     lap_b: TelemetryLapTrace
+    corners: list[TelemetryCorner] = []
     cache_hit: bool
     cache_key: str
 
@@ -273,6 +282,8 @@ class RaceDriverTrace(BaseModel):
     throttle: list[float]
     # The share of the laps on the brake at each point, 0 to 1.
     brake: list[float]
+    # The seconds spent on each point.
+    time: list[float]
 
 
 class RaceTracesResponse(BaseModel):

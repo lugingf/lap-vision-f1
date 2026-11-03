@@ -241,7 +241,7 @@ def _cache_key_for_telemetry(request: TelemetryCompareRequest) -> str:
     session_slug = request.session.strip().lower()
     return (
         f"telemetry/{request.year}/{event_slug}/{session_slug}/"
-        f"{request.driver_a.lower()}-{request.lap_a}__{request.driver_b.lower()}-{request.lap_b}.json"
+        f"{request.driver_a.lower()}-{request.lap_a}__{request.driver_b.lower()}-{request.lap_b}-v2.json"
     )
 
 
@@ -882,13 +882,14 @@ def fetch_telemetry_compare_payload(
         "session_name": getattr(session, "name", request.session),
         "lap_a": build_trace(request.driver_a, request.lap_a),
         "lap_b": build_trace(request.driver_b, request.lap_b),
+        "corners": _circuit_corner_distances(session) or [],
     }
 
 
 def _cache_key_for_race_traces(request: RaceTracesRequest) -> str:
     event_slug = _slugify_event(request.event)
     session_slug = request.session.strip().lower()
-    return f"traces/{request.year}/{event_slug}/{session_slug}/race-traces-v1-{request.bins}.json"
+    return f"traces/{request.year}/{event_slug}/{session_slug}/race-traces-v2-{request.bins}.json"
 
 
 def _bin_centres(bins: int) -> Any:
@@ -910,18 +911,38 @@ def _lap_on_bins(distance: Any, channels: dict[str, Any], centres: Any) -> dict[
     return {name: np.interp(centres, fraction, np.asarray(values, dtype=float)) for name, values in channels.items()}
 
 
+def _lap_elapsed(distance: Any, session_time: Any, lap_seconds: float, bins: int) -> Any | None:
+    """How long into one lap each edge between its points is reached, in seconds, from the clock of
+    its samples, stretched to the lap's own timed length. The speed channel is not trusted for this:
+    the distance it adds up to can be a tenth off from lap to lap."""
+    import numpy as np
+    import pandas as pd
+
+    distance = np.asarray(distance, dtype=float)
+    seconds = np.asarray(pd.to_timedelta(session_time).dt.total_seconds(), dtype=float)
+    if distance.size < 50 or not np.isfinite(distance[-1]) or distance[-1] <= 0 or lap_seconds <= 0:
+        return None
+    seconds = seconds - seconds[0]
+    if not np.isfinite(seconds[-1]) or seconds[-1] <= 0:
+        return None
+    edges = np.linspace(0.0, 1.0, bins + 1)
+    return np.interp(edges, distance / distance[-1], seconds) * (lap_seconds / seconds[-1])
+
+
 def _median_trace(laps: list[dict[str, Any]]) -> dict[str, list[float]]:
-    """The typical lap of several: the median speed and throttle at each point, and the share of
-    them on the brake there."""
+    """The typical lap of several: the median speed and throttle at each point, the share of them on
+    the brake there, and the time spent on each point, from the median time each edge is reached."""
     import numpy as np
 
     speed = np.median([lap["speed"] for lap in laps], axis=0)
     throttle = np.median([lap["throttle"] for lap in laps], axis=0)
     brake = np.mean([lap["brake"] for lap in laps], axis=0)
+    seconds = np.diff(np.median([lap["elapsed"] for lap in laps], axis=0))
     return {
         "speed": [round(float(value), 1) for value in speed],
         "throttle": [round(float(value), 1) for value in throttle],
         "brake": [round(float(value), 3) for value in brake],
+        "time": [round(float(value), 4) for value in seconds],
     }
 
 
@@ -969,15 +990,15 @@ def _corners_from_speed(speed: list[float], drop_kmh: float = 15.0) -> list[dict
     return corners
 
 
-def _circuit_corners(fastf1: Any, session: Any, lap_length_m: float) -> list[dict[str, Any]] | None:
-    """The circuit's own corners, numbered as it numbers them, from FastF1's circuit information.
-    None when it cannot be had."""
+def _circuit_corner_distances(session: Any) -> list[dict[str, Any]] | None:
+    """The circuit's own corners, numbered as it numbers them, each with how far round the lap it is
+    in metres, from FastF1's circuit information. None when it cannot be had."""
     try:
         info = session.get_circuit_info()
-    except Exception:  # noqa: BLE001 - the corners are a garnish; the traces stand without them
+    except Exception:  # noqa: BLE001 - the corners are a garnish; the laps stand without them
         return None
     corners = getattr(info, "corners", None)
-    if corners is None or len(corners) == 0 or lap_length_m <= 0:
+    if corners is None or len(corners) == 0:
         return None
     out: list[dict[str, Any]] = []
     for _, corner in corners.iterrows():
@@ -990,10 +1011,25 @@ def _circuit_corners(fastf1: Any, session: Any, lap_length_m: float) -> list[dic
             {
                 "number": number,
                 "letter": str(letter) if isinstance(letter, str) else "",
-                "fraction": round(min(max(distance / lap_length_m, 0.0), 1.0), 4),
+                "distance_m": round(distance, 1),
             }
         )
     return out or None
+
+
+def _circuit_corners(fastf1: Any, session: Any, lap_length_m: float) -> list[dict[str, Any]] | None:
+    """The circuit's own corners as fractions of the lap. None when they cannot be had."""
+    corners = _circuit_corner_distances(session)
+    if corners is None or lap_length_m <= 0:
+        return None
+    return [
+        {
+            "number": corner["number"],
+            "letter": corner["letter"],
+            "fraction": round(min(max(corner["distance_m"] / lap_length_m, 0.0), 1.0), 4),
+        }
+        for corner in corners
+    ]
 
 
 def fetch_race_traces_payload(request_payload: dict[str, Any], cache_dir: str) -> dict[str, Any]:
@@ -1047,7 +1083,11 @@ def fetch_race_traces_payload(request_payload: dict[str, Any], cache_dir: str) -
                     {"speed": telemetry["Speed"], "throttle": telemetry["Throttle"], "brake": telemetry["Brake"]},
                     centres,
                 )
-                if on_bins is not None:
+                elapsed = _lap_elapsed(
+                    telemetry["Distance"], telemetry["SessionTime"], lap["LapTime"].total_seconds(), bins
+                )
+                if on_bins is not None and elapsed is not None:
+                    on_bins["elapsed"] = elapsed
                     sampled.append(on_bins)
                 if reference is None or lap["LapTime"] < reference["LapTime"]:
                     reference = lap

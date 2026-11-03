@@ -8,6 +8,7 @@ from app.services.historical import (
     _bin_centres,
     _clean_race_laps,
     _corners_from_speed,
+    _lap_elapsed,
     _lap_on_bins,
     _median_trace,
 )
@@ -30,9 +31,9 @@ class LapOnBinsTests(unittest.TestCase):
 class MedianTraceTests(unittest.TestCase):
     def test_the_typical_lap_is_the_median_and_the_brake_a_share(self) -> None:
         laps = [
-            {"speed": [100.0, 200.0], "throttle": [0.0, 100.0], "brake": [1.0, 0.0]},
-            {"speed": [110.0, 210.0], "throttle": [10.0, 100.0], "brake": [1.0, 0.0]},
-            {"speed": [300.0, 205.0], "throttle": [100.0, 99.0], "brake": [0.0, 0.0]},
+            {"speed": [100.0, 200.0], "throttle": [0.0, 100.0], "brake": [1.0, 0.0], "elapsed": [0.0, 10.0, 15.0]},
+            {"speed": [110.0, 210.0], "throttle": [10.0, 100.0], "brake": [1.0, 0.0], "elapsed": [0.0, 9.0, 14.0]},
+            {"speed": [300.0, 205.0], "throttle": [100.0, 99.0], "brake": [0.0, 0.0], "elapsed": [0.0, 5.0, 14.5]},
         ]
         trace = _median_trace(laps)
 
@@ -40,6 +41,25 @@ class MedianTraceTests(unittest.TestCase):
         self.assertEqual(trace["speed"], [110.0, 205.0])
         self.assertEqual(trace["throttle"], [10.0, 100.0])
         self.assertEqual(trace["brake"], [0.667, 0.0])
+        # The time of each point is read between the median times its edges are reached, so the
+        # points add up to the median lap.
+        self.assertEqual(trace["time"], [9.0, 5.5])
+
+
+class LapElapsedTests(unittest.TestCase):
+    def test_the_clock_not_the_speed_says_how_long_a_stretch_took(self) -> None:
+        distance = [float(step) for step in range(100)]
+        clock = pd.Series(pd.to_timedelta([100.0 + step * 0.5 for step in range(100)], unit="s"))
+
+        elapsed = _lap_elapsed(distance, clock, 99.0, 2)
+
+        assert elapsed is not None
+        # The samples span 49.5 s of a lap timed at 99 s: the clock is stretched to the timed lap.
+        self.assertEqual([round(float(value), 3) for value in elapsed], [0.0, 49.5, 99.0])
+
+    def test_a_lap_with_too_few_samples_says_nothing(self) -> None:
+        clock = pd.Series(pd.to_timedelta([0.0, 1.0, 2.0], unit="s"))
+        self.assertIsNone(_lap_elapsed([0.0, 10.0, 20.0], clock, 3.0, 2))
 
 
 class CleanRaceLapsTests(unittest.TestCase):
