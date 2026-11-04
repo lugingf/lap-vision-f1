@@ -9,6 +9,7 @@ from app.services.historical import (
     _clean_race_laps,
     _corners_from_speed,
     _lap_elapsed,
+    _lap_gear_on_bins,
     _lap_on_bins,
     _median_trace,
 )
@@ -31,9 +32,27 @@ class LapOnBinsTests(unittest.TestCase):
 class MedianTraceTests(unittest.TestCase):
     def test_the_typical_lap_is_the_median_and_the_brake_a_share(self) -> None:
         laps = [
-            {"speed": [100.0, 200.0], "throttle": [0.0, 100.0], "brake": [1.0, 0.0], "elapsed": [0.0, 10.0, 15.0]},
-            {"speed": [110.0, 210.0], "throttle": [10.0, 100.0], "brake": [1.0, 0.0], "elapsed": [0.0, 9.0, 14.0]},
-            {"speed": [300.0, 205.0], "throttle": [100.0, 99.0], "brake": [0.0, 0.0], "elapsed": [0.0, 5.0, 14.5]},
+            {
+                "speed": [100.0, 200.0],
+                "throttle": [0.0, 100.0],
+                "brake": [1.0, 0.0],
+                "gear": [3, 7],
+                "elapsed": [0.0, 10.0, 15.0],
+            },
+            {
+                "speed": [110.0, 210.0],
+                "throttle": [10.0, 100.0],
+                "brake": [1.0, 0.0],
+                "gear": [3, 8],
+                "elapsed": [0.0, 9.0, 14.0],
+            },
+            {
+                "speed": [300.0, 205.0],
+                "throttle": [100.0, 99.0],
+                "brake": [0.0, 0.0],
+                "gear": [8, 6],
+                "elapsed": [0.0, 5.0, 14.5],
+            },
         ]
         trace = _median_trace(laps)
 
@@ -41,9 +60,23 @@ class MedianTraceTests(unittest.TestCase):
         self.assertEqual(trace["speed"], [110.0, 205.0])
         self.assertEqual(trace["throttle"], [10.0, 100.0])
         self.assertEqual(trace["brake"], [0.667, 0.0])
+        # The gear is the one most laps were in; three gears once each give the middle one.
+        self.assertEqual(trace["gear"], [3, 7])
         # The time of each point is read between the median times its edges are reached, so the
         # points add up to the median lap.
         self.assertEqual(trace["time"], [9.0, 5.5])
+
+
+class LapGearOnBinsTests(unittest.TestCase):
+    def test_a_point_takes_the_gear_of_the_nearest_sample(self) -> None:
+        distance = [float(step) for step in range(100)]
+        gear = [3] * 50 + [4] * 50
+
+        on_bins = _lap_gear_on_bins(distance, gear, _bin_centres(4))
+
+        assert on_bins is not None
+        # Never 3.5 between the two: a gear is one or the other.
+        self.assertEqual([int(value) for value in on_bins], [3, 3, 4, 4])
 
 
 class LapElapsedTests(unittest.TestCase):

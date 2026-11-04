@@ -889,7 +889,7 @@ def fetch_telemetry_compare_payload(
 def _cache_key_for_race_traces(request: RaceTracesRequest) -> str:
     event_slug = _slugify_event(request.event)
     session_slug = request.session.strip().lower()
-    return f"traces/{request.year}/{event_slug}/{session_slug}/race-traces-v2-{request.bins}.json"
+    return f"traces/{request.year}/{event_slug}/{session_slug}/race-traces-v3-{request.bins}.json"
 
 
 def _bin_centres(bins: int) -> Any:
@@ -929,9 +929,39 @@ def _lap_elapsed(distance: Any, session_time: Any, lap_seconds: float, bins: int
     return np.interp(edges, distance / distance[-1], seconds) * (lap_seconds / seconds[-1])
 
 
+def _lap_gear_on_bins(distance: Any, gear: Any, centres: Any) -> Any | None:
+    """One lap's gear at even fractions of its own length: the gear of the sample nearest each point,
+    since a gear between two samples is one or the other, never their mean."""
+    import numpy as np
+
+    distance = np.asarray(distance, dtype=float)
+    gear = np.asarray(gear, dtype=float)
+    if distance.size < 50 or not np.isfinite(distance[-1]) or distance[-1] <= 0:
+        return None
+    fraction = distance / distance[-1]
+    after = np.clip(np.searchsorted(fraction, centres), 1, fraction.size - 1)
+    before = after - 1
+    nearest = np.where(centres - fraction[before] <= fraction[after] - centres, before, after)
+    return gear[nearest]
+
+
+def _typical_gear(gears: list[Any]) -> list[int]:
+    """The gear most laps were in at each point; when gears tie, the lower middle one of them."""
+    import numpy as np
+
+    stacked = np.asarray(gears, dtype=int)
+    typical: list[int] = []
+    for column in stacked.T:
+        values, counts = np.unique(column, return_counts=True)
+        tied = sorted(int(value) for value in values[counts == counts.max()])
+        typical.append(tied[(len(tied) - 1) // 2])
+    return typical
+
+
 def _median_trace(laps: list[dict[str, Any]]) -> dict[str, list[float]]:
     """The typical lap of several: the median speed and throttle at each point, the share of them on
-    the brake there, and the time spent on each point, from the median time each edge is reached."""
+    the brake there, the gear most of them were in, and the time spent on each point, from the median
+    time each edge is reached."""
     import numpy as np
 
     speed = np.median([lap["speed"] for lap in laps], axis=0)
@@ -942,6 +972,7 @@ def _median_trace(laps: list[dict[str, Any]]) -> dict[str, list[float]]:
         "speed": [round(float(value), 1) for value in speed],
         "throttle": [round(float(value), 1) for value in throttle],
         "brake": [round(float(value), 3) for value in brake],
+        "gear": _typical_gear([lap["gear"] for lap in laps]),
         "time": [round(float(value), 4) for value in seconds],
     }
 
@@ -1086,8 +1117,10 @@ def fetch_race_traces_payload(request_payload: dict[str, Any], cache_dir: str) -
                 elapsed = _lap_elapsed(
                     telemetry["Distance"], telemetry["SessionTime"], lap["LapTime"].total_seconds(), bins
                 )
-                if on_bins is not None and elapsed is not None:
+                gear = _lap_gear_on_bins(telemetry["Distance"], telemetry["nGear"], centres)
+                if on_bins is not None and elapsed is not None and gear is not None:
                     on_bins["elapsed"] = elapsed
+                    on_bins["gear"] = gear
                     sampled.append(on_bins)
                 if reference is None or lap["LapTime"] < reference["LapTime"]:
                     reference = lap

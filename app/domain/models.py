@@ -282,6 +282,8 @@ class RaceDriverTrace(BaseModel):
     throttle: list[float]
     # The share of the laps on the brake at each point, 0 to 1.
     brake: list[float]
+    # The gear most of the laps were in at each point.
+    gear: list[int]
     # The seconds spent on each point.
     time: list[float]
 
