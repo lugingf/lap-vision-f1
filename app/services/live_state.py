@@ -133,21 +133,51 @@ OUTLINE_CLOSE_AFTER = 10000.0
 OUTLINE_CLOSE_WITHIN = 400.0
 OUTLINE_LOOKBACK = 60
 OUTLINE_MIN_POINTS = 150
+# Farther than a car goes between two position samples, even with a few of them lost: 200 m.
+OUTLINE_MAX_JUMP = 2000.0
+# So many jumps in a row are no glitch: the car is elsewhere, and the drawing starts again there.
+OUTLINE_JUMPS_BEFORE_RESTART = 10
+
+
+def _placeholder(x: float, y: float) -> bool:
+    """The feed sends a car at 0, 0 when it has no position for it, OnTrack or not."""
+    return x == 0 and y == 0
+
+
+def _closed_on_the_lap(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """An outline closed on the point of its first stretch the lap came back to, that stretch's
+    lead-in dropped: an older drawing closed on its very first point, out of the pits, and cut
+    across the circuit to it."""
+    body = points[:-1] if len(points) > 1 and points[0] == points[-1] else list(points)
+    if len(body) < 3:
+        return body + body[:1]
+    last = body[-1]
+    distances = [math.hypot(last[0] - px, last[1] - py) for px, py in body[:OUTLINE_LOOKBACK]]
+    nearest = min(range(len(distances)), key=distances.__getitem__)
+    if distances[0] > OUTLINE_MAX_JUMP and distances[nearest] <= OUTLINE_MAX_JUMP:
+        body = body[nearest:]
+    return body + body[:1]
 
 
 class Outline:
     """A circuit's outline drawn by one car going round: a point whenever it has moved far enough
     from the last, until it comes back to where it started. Coordinates are the feed's, tenths of a
-    metre."""
+    metre. A position the feed sends for want of one, and a jump no car makes between two samples,
+    are no part of it."""
 
     def __init__(self) -> None:
         self.points: list[tuple[float, float]] = []
         self.travelled = 0.0
         self.closed = False
         self.car: str | None = None
+        self.jumps = 0
+        # A kept outline found unusable: the one drawn here is to take its place.
+        self.replaces_kept = False
 
     def add(self, number: str, x: float | None, y: float | None) -> bool:
         if x is None or y is None or self.closed or len(self.points) >= OUTLINE_LIMIT:
+            return False
+        if _placeholder(x, y):
             return False
         if self.car is None:
             self.car = number
@@ -159,19 +189,53 @@ class Outline:
             step = math.hypot(x - last[0], y - last[1])
             if step < OUTLINE_MIN_STEP:
                 return False
+            if step > OUTLINE_MAX_JUMP:
+                self.jumps += 1
+                if self.jumps < OUTLINE_JUMPS_BEFORE_RESTART:
+                    return False
+                self.points, self.travelled, step = [], 0.0, 0.0
+        self.jumps = 0
         self.travelled += step
         if self.travelled > OUTLINE_CLOSE_AFTER and len(self.points) >= OUTLINE_MIN_POINTS:
-            for px, py in self.points[:OUTLINE_LOOKBACK]:
+            for index, (px, py) in enumerate(self.points[:OUTLINE_LOOKBACK]):
                 if math.hypot(x - px, y - py) < OUTLINE_CLOSE_WITHIN:
-                    self.points.append(self.points[0])
+                    # The car is back where the lap began: what it drew before that point was its
+                    # way onto the lap — out of the pits — and closing on it would cut across.
+                    self.points = self.points[index:] + [self.points[index]]
                     self.closed = True
                     return True
         self.points.append((x, y))
         return False
 
-    def load(self, points: list[dict[str, float]]) -> None:
-        self.points = [(float(point["x"]), float(point["y"])) for point in points]
+    def load(self, points: list[dict[str, float]]) -> bool:
+        """An outline kept from an earlier session, cleaned of what an older drawing let in: the
+        placeholder positions, and a point far from both its neighbours. One that still does not go
+        round — closed early on a placeholder, a stretch of the circuit never drawn — is not used,
+        and this session draws the circuit again to replace it."""
+        raw = [(float(point["x"]), float(point["y"])) for point in points]
+        raw = [point for point in raw if not _placeholder(*point)]
+        cleaned = []
+        for index, point in enumerate(raw):
+            before = raw[index - 1] if index > 0 else None
+            after = raw[index + 1] if index + 1 < len(raw) else None
+            far = [
+                math.hypot(point[0] - other[0], point[1] - other[1]) > OUTLINE_MAX_JUMP
+                for other in (before, after)
+                if other is not None
+            ]
+            if far and all(far):
+                continue
+            cleaned.append(point)
+        closed = _closed_on_the_lap(cleaned)
+        if (
+            len(closed) < 3
+            or math.hypot(closed[-2][0] - closed[-1][0], closed[-2][1] - closed[-1][1]) > OUTLINE_MAX_JUMP
+        ):
+            self.replaces_kept = True
+            return False
+        self.points = closed
         self.closed = True
+        return True
 
     def payload(self, circuit: str | None) -> dict[str, Any]:
         return {

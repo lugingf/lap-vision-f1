@@ -290,11 +290,12 @@ class LiveSessionService:
             return
         path = self._outline_file(circuit)
         if state.outline.closed:
-            if not path.exists():
+            if not path.exists() or state.outline.replaces_kept:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(json.dumps(state.outline_payload()["polyline"]))
+                state.outline.replaces_kept = False
             return
-        if not state.outline.points and path.exists():
+        if not state.outline.points and not state.outline.replaces_kept and path.exists():
             try:
                 state.outline.load(json.loads(path.read_text()))
             except (OSError, ValueError, KeyError, TypeError):

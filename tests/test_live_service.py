@@ -93,6 +93,31 @@ class OutlineKeepingTests(unittest.TestCase):
             service._sync_outline(session)
             self.assertEqual(session.state.outline.points, [])
 
+    def test_an_outline_kept_that_does_not_go_round_is_drawn_again_and_replaced(self) -> None:
+        """Interlagos 2026: the kept outline had closed early on a placeholder at 0, 0, a stretch
+        of the circuit never drawn. The session draws the circuit again and keeps its own."""
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            service = _service(directory)
+            kept = directory / "outlines" / "12.json"
+            kept.parent.mkdir()
+            half = [
+                {"x": math.cos(math.radians(d)) * 5000, "y": math.sin(math.radians(d)) * 5000} for d in range(0, 180, 2)
+            ]
+            kept.write_text(json.dumps([*half, {"x": 0, "y": 0}, half[0]]))
+
+            session = _session(directory, recorded=True)
+            _circuit(session)
+            service._sync_outline(session)
+            self.assertFalse(session.state.outline.closed)
+
+            _drive_a_lap(session)
+            service._sync_outline(session)
+            replaced = json.loads(kept.read_text())
+            self.assertGreater(len(replaced), len(half) + 2)
+            steps = [math.hypot(b["x"] - a["x"], b["y"] - a["y"]) for a, b in zip(replaced, replaced[1:], strict=False)]
+            self.assertLess(max(steps), 1000)
+
 
 class TailTests(unittest.TestCase):
     def test_a_service_that_starts_late_reads_the_recording_from_the_top(self) -> None:

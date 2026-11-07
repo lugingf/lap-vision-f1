@@ -6,7 +6,7 @@ import unittest
 import zlib
 from pathlib import Path
 
-from app.services.live_state import LiveState, decode_compressed, merge
+from app.services.live_state import LiveState, Outline, decode_compressed, merge
 
 FIXTURE = Path(__file__).parent / "fixtures" / "live_race_sample.txt"
 
@@ -348,16 +348,78 @@ class OutlineTests(unittest.TestCase):
 
     def test_a_loaded_outline_is_not_redrawn(self) -> None:
         state = LiveState()
-        state.outline.load([{"x": 0, "y": 0}, {"x": 100, "y": 0}])
+        state.outline.load([{"x": 100, "y": 0}, {"x": 200, "y": 0}, {"x": 100, "y": 0}])
         state.feed("Position.z", _position_message("2026-10-04T09:00:00Z", 5000, 5000))
-        self.assertEqual(len(state.outline_payload()["polyline"]), 2)
+        self.assertEqual(len(state.outline_payload()["polyline"]), 3)
 
     def test_only_one_car_draws_it(self) -> None:
         state = LiveState()
-        state.feed("Position.z", _position_message("2026-10-04T09:00:00Z", 0, 0))
+        state.feed("Position.z", _position_message("2026-10-04T09:00:00Z", 100, 100))
         other = {"44": {"Status": "OnTrack", "X": 900, "Y": 900, "Z": 0}}
         state.feed("Position.z", {"Position": [{"Timestamp": "2026-10-04T09:00:01Z", "Entries": other}]})
         self.assertEqual(len(state.outline_payload()["polyline"]), 1)
+
+    def test_a_car_without_a_position_draws_nothing(self) -> None:
+        """The feed puts a car at 0, 0, OnTrack, when it has no position for it: drawn, it was a
+        spoke from the circuit to the origin and back (Interlagos, 2026)."""
+        state = LiveState()
+        circle = [(math.cos(math.radians(d)) * 5000, math.sin(math.radians(d)) * 5000) for d in range(360)]
+        state.feed("Position.z", _position_message("2026-10-04T09:00:00Z", *circle[0]))
+        state.feed("Position.z", _position_message("2026-10-04T09:00:00Z", 0, 0))
+        for _ in range(2):
+            for x, y in circle[1:]:
+                state.feed("Position.z", _position_message("2026-10-04T09:00:00Z", x, y))
+        outline = state.outline_payload()
+        self.assertTrue(outline["closed"])
+        self.assertNotIn({"x": 0, "y": 0}, outline["polyline"])
+        steps = [
+            math.hypot(b["x"] - a["x"], b["y"] - a["y"])
+            for a, b in zip(outline["polyline"], outline["polyline"][1:], strict=False)
+        ]
+        self.assertLess(max(steps), 1000)
+
+    def test_a_jump_no_car_makes_is_left_out(self) -> None:
+        state = LiveState()
+        for x, y in [(100, 100), (400, 100), (9000, 9000), (700, 100)]:
+            state.feed("Position.z", _position_message("2026-10-04T09:00:00Z", x, y))
+        self.assertEqual(
+            state.outline_payload()["polyline"],
+            [{"x": 100, "y": 100}, {"x": 400, "y": 100}, {"x": 700, "y": 100}],
+        )
+
+    def test_a_car_somewhere_else_for_good_starts_the_drawing_again(self) -> None:
+        state = LiveState()
+        state.feed("Position.z", _position_message("2026-10-04T09:00:00Z", 100, 100))
+        for step in range(12):
+            state.feed("Position.z", _position_message("2026-10-04T09:00:00Z", 9000 + step * 100, 9000))
+        polyline = state.outline_payload()["polyline"]
+        self.assertNotIn({"x": 100, "y": 100}, polyline)
+        self.assertGreater(len(polyline), 1)
+
+    def test_a_kept_outline_is_cleaned_of_what_an_older_drawing_let_in(self) -> None:
+        """An outline kept from an earlier session with a placeholder and a spike in it is drawn
+        without them, still closed."""
+        outline = Outline()
+        outline.load(
+            [
+                {"x": -3388, "y": -5540},
+                {"x": 0, "y": 0},
+                {"x": -3048, "y": -6809},
+                {"x": 40000, "y": 40000},
+                {"x": -3200, "y": -6000},
+                {"x": -3388, "y": -5540},
+            ]
+        )
+        self.assertEqual(outline.points, [(-3388, -5540), (-3048, -6809), (-3200, -6000), (-3388, -5540)])
+        self.assertTrue(outline.closed)
+
+    def test_a_kept_outline_that_does_not_go_round_is_not_used(self) -> None:
+        outline = Outline()
+        usable = outline.load([{"x": 5000, "y": 0}, {"x": 0, "y": 5000}, {"x": -5000, "y": 0}, {"x": 5000, "y": 0}])
+        self.assertFalse(usable)
+        self.assertFalse(outline.closed)
+        self.assertEqual(outline.points, [])
+        self.assertTrue(outline.replaces_kept)
 
 
 if __name__ == "__main__":
