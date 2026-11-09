@@ -124,6 +124,33 @@ class CleanRaceLapsTests(unittest.TestCase):
         # against a median of 80.
         self.assertEqual(list(kept["LapNumber"]), [2, 3])
 
+    def test_laps_in_the_wet_and_in_the_dry_are_kept_apart(self) -> None:
+        second = pd.Timedelta(seconds=1)
+        laps = pd.DataFrame(
+            {
+                "LapNumber": [2, 3, 4, 5, 6, 7, 8, 9],
+                "LapTime": [
+                    88 * second,
+                    87 * second,
+                    88 * second,
+                    76 * second,
+                    75 * second,
+                    76 * second,
+                    75 * second,
+                    76 * second,
+                ],
+                "PitInTime": [pd.NaT] * 8,
+                "PitOutTime": [pd.NaT] * 8,
+                "Compound": ["INTERMEDIATE", "INTERMEDIATE", "INTERMEDIATE", "SOFT", "SOFT", "SOFT", "SOFT", None],
+            }
+        )
+
+        # Mixed, the wet laps are more than 7% off the median and fall away; apart, each condition
+        # is measured against its own median. A lap with no tyre named counts as dry.
+        self.assertEqual(list(_clean_race_laps(laps)["LapNumber"]), [5, 6, 7, 8, 9])
+        self.assertEqual(list(_clean_race_laps(laps, "wet")["LapNumber"]), [2, 3, 4])
+        self.assertEqual(list(_clean_race_laps(laps, "dry")["LapNumber"]), [5, 6, 7, 8, 9])
+
 
 class CornersFromSpeedTests(unittest.TestCase):
     def test_the_slow_points_of_a_lap_are_its_corners_in_order(self) -> None:

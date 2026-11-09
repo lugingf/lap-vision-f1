@@ -302,7 +302,10 @@ class RaceTracesResponse(BaseModel):
     # "circuit_info" when the corners are the circuit's own numbers, "speed" when they were found
     # from the slow points of the lap and are numbered in order.
     corners_source: str | None = None
+    # Typical laps on tyres for a dry track, and on intermediates and wets: each the median of the
+    # laps on its own tyres, as the two are not one pace.
     drivers: list[RaceDriverTrace] = []
+    wet_drivers: list[RaceDriverTrace] = []
     cache_hit: bool = False
     cache_key: str = ""
 

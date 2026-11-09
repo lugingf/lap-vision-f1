@@ -889,7 +889,7 @@ def fetch_telemetry_compare_payload(
 def _cache_key_for_race_traces(request: RaceTracesRequest) -> str:
     event_slug = _slugify_event(request.event)
     session_slug = request.session.strip().lower()
-    return f"traces/{request.year}/{event_slug}/{session_slug}/race-traces-v3-{request.bins}.json"
+    return f"traces/{request.year}/{event_slug}/{session_slug}/race-traces-v4-{request.bins}.json"
 
 
 def _bin_centres(bins: int) -> Any:
@@ -977,10 +977,17 @@ def _median_trace(laps: list[dict[str, Any]]) -> dict[str, list[float]]:
     }
 
 
-def _clean_race_laps(driver_laps: Any) -> Any:
+# Tyres for a wet track. Every other lap, its tyre named or not, is a lap on a dry one.
+_WET_COMPOUNDS = {"INTERMEDIATE", "WET"}
+
+
+def _clean_race_laps(driver_laps: Any, condition: str | None = None) -> Any:
     """The laps of one driver that measure his pace: not the first, not into or out of the pits,
     run under green flag from start to finish, not deleted, timed, and no more than 7% off his own
-    median — a lap held up in traffic or off the road is no lap to average."""
+    median — a lap held up in traffic or off the road is no lap to average.
+
+    Given a condition, "dry" or "wet", only the laps on tyres for it are kept, and the median is of
+    those: a lap in the wet is far slower than one in the dry, and the two are not one pace."""
     laps = driver_laps[
         (driver_laps["LapNumber"] > 1)
         & driver_laps["PitInTime"].isna()
@@ -991,6 +998,9 @@ def _clean_race_laps(driver_laps: Any) -> Any:
         laps = laps[laps["TrackStatus"].astype(str).str.fullmatch("1")]
     if "Deleted" in laps.columns:
         laps = laps[~laps["Deleted"].eq(True)]
+    if condition is not None and "Compound" in laps.columns:
+        wet = laps["Compound"].astype(str).str.upper().isin(_WET_COMPOUNDS)
+        laps = laps[wet] if condition == "wet" else laps[~wet]
     if laps.empty:
         return laps
     return laps[laps["LapTime"] <= laps["LapTime"].median() * 1.07]
@@ -1100,35 +1110,38 @@ def fetch_race_traces_payload(request_payload: dict[str, Any], cache_dir: str) -
 
         centres = _bin_centres(bins)
         drivers: list[dict[str, Any]] = []
+        wet_drivers: list[dict[str, Any]] = []
         reference: Any = None
         for driver_code in sorted({str(code) for code in laps_frame["Driver"].dropna().unique()}):
-            clean = _clean_race_laps(laps_frame.pick_drivers(driver_code))
-            sampled: list[dict[str, Any]] = []
-            for _, lap in clean.iterlaps():
-                try:
-                    telemetry = lap.get_car_data().add_distance()
-                except Exception:  # noqa: BLE001 - a lap with no car data is passed over
+            driver_laps = laps_frame.pick_drivers(driver_code)
+            for condition, traces in (("dry", drivers), ("wet", wet_drivers)):
+                clean = _clean_race_laps(driver_laps, condition)
+                sampled: list[dict[str, Any]] = []
+                for _, lap in clean.iterlaps():
+                    try:
+                        telemetry = lap.get_car_data().add_distance()
+                    except Exception:  # noqa: BLE001 - a lap with no car data is passed over
+                        continue
+                    on_bins = _lap_on_bins(
+                        telemetry["Distance"],
+                        {"speed": telemetry["Speed"], "throttle": telemetry["Throttle"], "brake": telemetry["Brake"]},
+                        centres,
+                    )
+                    elapsed = _lap_elapsed(
+                        telemetry["Distance"], telemetry["SessionTime"], lap["LapTime"].total_seconds(), bins
+                    )
+                    gear = _lap_gear_on_bins(telemetry["Distance"], telemetry["nGear"], centres)
+                    if on_bins is not None and elapsed is not None and gear is not None:
+                        on_bins["elapsed"] = elapsed
+                        on_bins["gear"] = gear
+                        sampled.append(on_bins)
+                    if reference is None or lap["LapTime"] < reference["LapTime"]:
+                        reference = lap
+                if len(sampled) < 3:
                     continue
-                on_bins = _lap_on_bins(
-                    telemetry["Distance"],
-                    {"speed": telemetry["Speed"], "throttle": telemetry["Throttle"], "brake": telemetry["Brake"]},
-                    centres,
-                )
-                elapsed = _lap_elapsed(
-                    telemetry["Distance"], telemetry["SessionTime"], lap["LapTime"].total_seconds(), bins
-                )
-                gear = _lap_gear_on_bins(telemetry["Distance"], telemetry["nGear"], centres)
-                if on_bins is not None and elapsed is not None and gear is not None:
-                    on_bins["elapsed"] = elapsed
-                    on_bins["gear"] = gear
-                    sampled.append(on_bins)
-                if reference is None or lap["LapTime"] < reference["LapTime"]:
-                    reference = lap
-            if len(sampled) < 3:
-                continue
-            drivers.append({"driver_code": driver_code, "laps_used": len(sampled), **_median_trace(sampled)})
+                traces.append({"driver_code": driver_code, "laps_used": len(sampled), **_median_trace(sampled)})
 
-        if not drivers or reference is None:
+        if not (drivers or wet_drivers) or reference is None:
             payload["message"] = "no driver has enough clean laps"
             return payload
 
@@ -1151,10 +1164,13 @@ def fetch_race_traces_payload(request_payload: dict[str, Any], cache_dir: str) -
         if corners is not None:
             payload["corners"], payload["corners_source"] = corners, "circuit_info"
         else:
-            fastest = min(drivers, key=lambda driver: sum(1.0 / max(value, 1.0) for value in driver["speed"]))
+            fastest = min(
+                drivers or wet_drivers, key=lambda driver: sum(1.0 / max(value, 1.0) for value in driver["speed"])
+            )
             payload["corners"], payload["corners_source"] = _corners_from_speed(fastest["speed"]), "speed"
 
         payload["drivers"] = drivers
+        payload["wet_drivers"] = wet_drivers
         payload["available"] = True
         return payload
     finally:
